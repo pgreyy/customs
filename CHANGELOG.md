@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.3
+
+- Script inspection and the pipe-into-a-shell approval now run even before any bait is planted. With no bait there
+  is nothing to match paths or values against, but a local script is still read before it runs.
+- `.bait.lock` is created with mode 600, and an existing lock file is tightened to 600.
+- README corrected to match the code, with the limits listed plainly.
+
 ## 0.6.2
 
 - The likely source of an incident now comes only from a call that actually read something. A web, browser or

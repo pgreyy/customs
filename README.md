@@ -6,9 +6,9 @@ An agent with a shell reads a lot of text it didn't write. Web pages, emails, Gi
 
 A careful agent ignores that. A hijacked one starts digging through your home folder, and most of the time you find out after the keys are already gone.
 
-customs plants fake credential files right where that digging would land, then watches every tool call the agent makes. The moment a call reaches for one of those files, customs stops it before the tool runs, and your phone buzzes.
+customs plants fake credential files right where that digging would land, then watches every tool call the agent makes. The moment a call reaches for one of those files, customs stops it before the tool runs and alerts you in the chat. Turn on push alerts and your phone buzzes too.
 
-It also keeps a short trail of what the agent did in the session. So a block doesn't just say "blocked". It shows you what the agent was doing right before: the page it read, the folder it searched, the archive it built. And when an upload comes right after a credential search and some suspicious packaging, customs pauses and asks you first, even if no bait file was touched.
+It also keeps a short trail of what the agent did in the session. So a block doesn't just say "blocked". It shows you what the agent was doing right before: the page it read, the credential search it ran, the archive it built. And when an upload comes right after a credential search and some suspicious packaging, customs pauses and asks you first, even if no bait file was touched.
 
 The idea in one line: customs is built to catch the hunt, not just the leak.
 
@@ -63,6 +63,8 @@ Lockdown: on for this session
 
 The links in alerts are broken on purpose (`hxxps`, `[.]`). In a real attack that address belongs to the attacker, and nobody should be one thumb tap away from it on a lock screen.
 
+The preview is the call exactly as the agent made it, masked and cut to 200 characters. If the agent used the full path instead of `~`, that's what you'll see, and long unbroken runs of characters show as `‹redacted›`.
+
 ### 3. Read the record
 
 ```text
@@ -70,7 +72,7 @@ The links in alerts are broken on purpose (`hxxps`, `[.]`). In a real attack tha
 /customs export
 ```
 
-`incidents` shows the rule, the bait file, the likely source, the outcome, and the steps just before. `export` writes the same records to a JSON file only you can read. Neither one stores a fake value, file contents or full tool arguments.
+`incidents` shows the rule, the bait file, the likely source, the outcome, and the steps just before. `export` writes the same records to a JSON file only you can read. Neither one stores a fake value or file contents, and a call is kept only as a masked preview of its first 200 characters.
 
 ### 4. Check it is really working
 
@@ -100,7 +102,7 @@ flowchart TD
     P -->|"broad action<br/>near bait"| R["Ask for approval"]
     P -->|"upload after a credential<br/>search and packaging"| C["Chain alert:<br/>ask for approval"]
     B --> L["Session lockdown"]
-    A -. "every tool call" .-> E["Session trail"]
+    A -. "searches, archives,<br/>encodings, uploads" .-> E["Session trail"]
     E -.-> P
     A -. "tool result" .-> T["transform_tool_result<br/>redact fake values"]
     A -. "outgoing request" .-> M["llm_request<br/>redact fake values"] -.-> MP["Model provider"]
@@ -118,9 +120,9 @@ customs registers a `pre_tool_call` hook, so it sees every tool call before the 
 
 A clear hit is blocked. A broad action near bait, like archiving or syncing the folder it sits in, goes to you for approval instead, since that one could be innocent.
 
-### Fake values never travel
+### Fake values get caught on the way out
 
-A bait file can still get read through some route customs didn't anticipate. So it also tracks the fake values it generated, in plain form, as any run of 16 or more of their characters, and as base64, base64url, hex, URL encoded and reversed text.
+A bait file can still get read through some route customs didn't anticipate. So it also tracks the fake values it generated, in plain form, as any run of 16 or more of their characters, and as base64, base64url, hex, URL encoded and reversed text. Other forms slip through: pieces shorter than 16 characters, double encoding, base32, ROT13, compression, a changed letter case.
 
 A fake value in a tool's arguments blocks the call. A fake value in a tool result, or in the request on its way to the model provider, is replaced with `[customs: protected]` before it goes any further. That last one matters: checking only the agent's final answer would be too late, because the value would already have gone out to the provider.
 
@@ -140,15 +142,15 @@ That trail is what fills the "earlier in this session" part of every incident, a
 
 Some attacks never touch a bait file. The agent searches for keys, packs what it finds, and uploads it.
 
-customs watches for that shape inside a 30 minute window: a credential search, then packaging that names a credential location (or archiving plus encoding), then an upload in the current call. All three, in that order. When it sees them, it asks for your approval before the upload runs. Everyday work like `git push`, `scp` deploys, log shipping or plain compression doesn't trigger it, and each chain is only raised once.
+customs watches for that shape inside a 30 minute window. First a credential search (or a bait hit). Then either packaging that names a credential location, or archiving plus encoding. Then an upload in the current call. An upload that itself names a credential location counts too, even with no packaging step in between. Always in that order. When it sees them, it asks for your approval before the upload runs. Everyday work like `git push`, `scp` deploys, log shipping or plain compression doesn't trigger it, and each chain is only raised once.
 
-I want to be straight about this one. It is pattern matching on command text. Someone determined can phrase commands to slip past it, and it can't prove the steps are connected, which is why the alert says "not proven connected" and why it asks instead of blocking. If the chain code ever hits an error, the call goes through. The bait tripwire stays the only thing that blocks outright.
+I want to be straight about this one. It is pattern matching on command text. Someone determined can phrase commands to slip past it, and it can't prove the steps are connected, which is why the alert says "not proven connected" and why it asks instead of blocking. If the chain code ever hits an error, the call goes through. Chain alerts never block. Only three things block outright: a bait file, a fake value in a tool's arguments, and a script that both hunts for credentials and uploads.
 
 ### Lockdown and alerts
 
 After a block, the session goes into lockdown by default: any network action in that session (web and browser tools, `curl`, `ssh`, `git push`) needs your approval until you run `/customs unlock`.
 
-Every incident records the tool, the rule, the bait file, a masked preview, the likely untrusted source when customs can tie one to the session, the outcome, the severity, the lockdown state, and the steps just before. When customs asks for approval, it also records whether you approved or denied.
+Every incident records the tool, the rule, the bait file, a masked preview, the likely untrusted source when customs can tie one to the session, the outcome, the severity, the lockdown state, and the steps just before. When customs asks for approval and you answer, it records whether you approved or denied. A timeout, or a request Hermes lets through because you answered "session" or "always" earlier, stays recorded as "escalated to approval".
 
 ## How it differs
 
@@ -213,13 +215,16 @@ plugins:
 
 Without `alert_target`, alerts only show up in the chat where the incident happened.
 
-**Network behavior.** customs makes no network calls unless you set `alert_target`. Push alerts go through your existing Hermes messaging setup and carry the rule, the bait file's path, the likely source, a masked preview of the call (up to 200 characters), the outcome, severity and lockdown state, and up to 5 short step labels from earlier in the session (hosts, shortened paths, command names). Links in alerts are broken so they can't be tapped. Fake values, file contents and full tool arguments are never sent.
+**Network behavior.** customs makes no network calls unless you set `alert_target`. Push alerts go through your existing Hermes messaging setup and carry a one line "what happened", the tool name, the rule, the bait file's path, the likely source, a masked preview of the call (its first 200 characters, which for a short command is the whole command), the outcome, severity and lockdown state, and up to 5 short step labels from earlier in the session, or up to 6 steps for a chain alert (hosts, shortened paths, command names). Chain alerts add the pattern that matched, and script alerts add the script's path. Links in alerts are broken so they can't be tapped. Fake values and file contents are never sent.
 
 ## Limitations
 
 customs is narrow on purpose. Know where it stops:
 
 - **It only catches what touches its bait.** An agent that goes straight to a real credential and never comes near a bait file or a fake value gets past the tripwire. Chain alerts narrow that gap. They don't close it.
+- **Fake values can slip through in other forms.** Pieces shorter than 16 characters, double encoding, base32, ROT13, compression or a changed letter case aren't recognized.
+- **Push alerts are off until you set `alert_target`.** Without it, an alert only shows in the chat where it happened, and you see it when you next look.
+- **Previews show part of the call.** Incidents and alerts keep the first 200 characters of a call, masked. For a short command that's the whole command.
 - **It doesn't protect real credentials.** Keep using file permissions and Hermes' own secret redaction.
 - **It sees the Hermes tool loop, not your whole machine.** Other programs and background processes are outside its view.
 - **Much of the detection is pattern based.** A path assembled at runtime, a payload downloaded after inspection, or a cleverly phrased command chain can slip through. A search that only lists file names is not blocked.
@@ -236,11 +241,11 @@ Use customs as one layer among several, not as a replacement for credential hygi
 | Category | Behavior |
 | --- | --- |
 | Reads | Tool arguments and results passing through its hooks, and outgoing model provider requests, in memory. Its own state and error log. Bait files it planted. Local scripts a command is about to run (up to 8 files, 512 KB each). Folder names under your home directory during `/customs blend`. Your approve or deny answer to approvals customs itself asked for. |
-| Writes | Bait files it plants (mode 600, new parent folders 700). Its registry, incident log, error log, likely source list, lockdown state and export file in the Hermes plugin data directory (mode 600). |
+| Writes | Bait files it plants (mode 600, new parent folders 700). In the Hermes plugin data directory, all mode 600: its registry, a one time backup of an older registry format (`bait.v1-backup.json`), an empty lock file (`.bait.lock`), the incident log, error log, likely source list, lockdown state and export file. |
 | Keeps in memory | The session trail: up to 50 masked event labels per session, for up to 200 sessions. Nothing from it is written to disk except the few steps attached to an incident. |
 | Executes | `git check-ignore`, to check whether a path inside a Git repository is ignored. `hermes send`, only when `alert_target` is set. |
 | Network | None by default. Optional push alerts go through your Hermes messaging route with the fields listed under Network behavior. |
-| Incident records | Never store fake values, file contents or full tool arguments. |
+| Incident records | Never store fake values or file contents. A call is kept only as a masked preview of its first 200 characters. |
 
 ## Test it
 

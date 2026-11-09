@@ -276,6 +276,17 @@ def on_pre_tool_call(tool_name=None, args=None, **kwargs):
                     decision = detect.Decision("block", "value-in-args", sorted(hits)[0][0],
                                                _preview(tool_name, args))
                     extra = {"value_name": _value_names(hits)}
+        elif tool_name == "terminal" and isinstance(args, dict) and isinstance(args.get("command"), str):
+            # No bait planted yet: there is nothing to match a path or value against,
+            # but a script can still be read before it runs, and a download piped into
+            # a shell still needs approval. Same inspection as with bait, minus bait paths.
+            last = _LAST_CD.get(session_id) if session_id else None
+            ctx_info = detect.Context(cwd=_session_cwd(), home=_HOME,
+                                      extra_bases=(last,) if last else ())
+            wd = args.get("workdir")
+            if isinstance(wd, str) and wd.strip():
+                ctx_info.cwd = detect.normalize(wd.strip(), ctx_info.cwd, ctx_info)
+            decision = detect.inspect_scripts(args["command"], detect._bait(frozenset()), ctx_info)
         # The decision above is final. Logging what this call does comes after it.
         before, _cur = _log_events(session_id, tool_name, _call_events(tool_name, args, decision, index))
         if decision is not None:

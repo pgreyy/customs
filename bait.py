@@ -348,7 +348,12 @@ def _locked_registry(data_dir):
     """Lock, load (migrating a Phase 1 registry and keeping a backup of it),
     yield the registry, and save it afterwards."""
     Path(data_dir).mkdir(parents=True, exist_ok=True)
-    with open(Path(data_dir) / ".bait.lock", "a+") as fh:
+    fd = os.open(Path(data_dir) / ".bait.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)  # an older lock file may have been created with default permissions
+    except OSError:
+        pass
+    with os.fdopen(fd, "a+") as fh:
         try:
             import fcntl
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
