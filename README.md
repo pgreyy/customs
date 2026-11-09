@@ -128,9 +128,9 @@ A fake value in a tool's arguments blocks the call. A fake value in a tool resul
 
 ### Scripts get read first
 
-When a command is about to run a local script (shell, Python, Node, `./script`, or an npm, pnpm or yarn script), customs reads the script text first, plus one level of scripts it calls: up to 8 files, 512 KB each.
+When a command is about to run a local script (shell, Python, Node, `./script`, or an npm, pnpm or yarn script), customs reads the script text first, plus one level of scripts it calls: up to 8 files, 512 KB each. That covers commands in the terminal, input sent to a background shell, and commands that `execute_code` or `browser_exec` code passes to `subprocess`, `os.system` and similar calls, as long as the command is written in the code as a string, a list, a variable or an f-string.
 
-A credential hunt plus an upload in the same script is blocked. A hunt with no upload goes to you for approval. Piping a download straight into a shell always needs approval, because there's nothing to inspect beforehand. This is pattern reading, not a sandbox. It can't prove what code will do once it runs.
+A credential hunt plus an upload in the same script is blocked. A hunt with no upload goes to you for approval. Piping a download straight into a shell always needs approval, because there's nothing to inspect beforehand. That check also runs on text typed through `computer_use`. This is pattern reading, not a sandbox. It can't prove what code will do once it runs.
 
 ### The session trail
 
@@ -148,7 +148,7 @@ I want to be straight about this one. It is pattern matching on command text. So
 
 ### Lockdown and alerts
 
-After a block, the session goes into lockdown by default: any network action in that session (web and browser tools, `curl`, `ssh`, `git push`) needs your approval until you run `/customs unlock`.
+After a block, the session goes into lockdown by default: any network action in that session (web and browser tools, `curl`, `ssh`, `git push`) needs your approval until you run `/customs unlock`. So do input to a background shell, typing through `computer_use`, creating or running cron jobs, and starting or steering subagents, since each of those can run work customs can't see call by call.
 
 Every incident records the tool, the rule, the bait file, a masked preview, the likely untrusted source when customs can tie one to the session, the outcome, the severity, the lockdown state, and the steps just before. When customs asks for approval and you answer, it records whether you approved or denied. A timeout, or a request Hermes lets through because you answered "session" or "always" earlier, stays recorded as "escalated to approval".
 
@@ -232,6 +232,9 @@ customs is narrow on purpose. Know where it stops:
 - **Approval is only as good as the answer.** If you approve an action customs asked about, it runs.
 - **Source attribution is best effort.** customs names a likely source when the session history supports one. Not every incident has a provable source.
 - **The session trail lives in memory.** It is empty again after a Hermes restart, so a chain split across a restart won't be seen.
+- **Cron scripts run outside the tool loop.** Hermes' scheduler runs a cron job's script directly, so customs only checks the job when it's created.
+- **Calls made from inside `execute_code` have no session id.** They still get the bait, value and script checks, but lockdown, the session trail and chain alerts can't see them.
+- **Subagents run under their own session.** A `delegate_task` subagent doesn't inherit the parent's lockdown or trail.
 - **It fails open on its own errors.** If customs hits an internal error while checking a call, it lets the call through and logs the error, because a crash inside a `pre_tool_call` hook would otherwise block every tool call you make. An unreadable bait registry at startup means nothing is watched until it's fixed. `/customs check` reports both.
 
 Use customs as one layer among several, not as a replacement for credential hygiene, least privilege or endpoint security.

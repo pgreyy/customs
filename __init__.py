@@ -17,7 +17,7 @@ import threading
 import time
 from types import SimpleNamespace
 
-from . import alerts, bait, correlate, detect, events, lockdown, provenance, valuescan
+from . import alerts, bait, codecmds, correlate, detect, events, lockdown, provenance, valuescan
 
 RESULT_NOTICE = ("customs: this output contained protected credentials and was redacted. "
                  "The user has been alerted.")
@@ -121,7 +121,7 @@ def _remember_cd(session_id, command, ctx_info) -> None:
 def _preview(tool_name, args) -> str:
     """What the call looked like: the command, code, path or URL, else the args."""
     a = detect._as_dict(args)
-    for key in ("command", "code", "path", "url", "urls", "query"):
+    for key in ("command", "code", "path", "url", "urls", "query", "data", "text"):
         v = a.get(key)
         if isinstance(v, str) and v:
             return v[:4000]
@@ -248,16 +248,81 @@ def _value_names(hits) -> str:
     return ",".join(sorted({name for _p, name in hits}))
 
 
+# Input sent to a running background shell is a command line like any other.
+_PROCESS_INPUT = {"write", "submit"}
+# While a session is locked, these count as network actions too: they can run or
+# start work that customs can't see call by call.
+_LOCKED_ACTIONS = {
+    "process_manage": {"write", "submit"},
+    "computer_use": {"type", "key", "set_value"},
+    "cronjob_manage": {"create", "update", "run", "resume"},
+    "delegate_task": {"spawn", "steer", ""},
+}
+
+
+def _as_terminal(tool_name, args):
+    """(tool, args) to check: process_manage input is checked as a terminal command."""
+    if tool_name == "process_manage" and isinstance(args, dict) \
+            and str(args.get("action") or "") in _PROCESS_INPUT and isinstance(args.get("data"), str):
+        return "terminal", {"command": args["data"]}
+    return tool_name, args
+
+
+def _locked_extra(tool_name, args) -> bool:
+    actions = _LOCKED_ACTIONS.get(tool_name or "")
+    if actions is None:
+        return False
+    action = str((args or {}).get("action") or "") if isinstance(args, dict) else ""
+    return action in actions
+
+
+def _stronger(a, b):
+    """The stronger of two decisions: block beats approve beats none."""
+    if a is None:
+        return b
+    if b is None or a.action == "block":
+        return a
+    return b if b.action == "block" else a
+
+
+def _extra_inspection(tool_name, args, index, ctx_info):
+    """Script inspection and the pipe-into-a-shell check where the terminal path
+    doesn't reach: command strings inside execute_code / browser_exec code, and
+    text typed through computer_use. Never raises; None when nothing applies."""
+    try:
+        a = args if isinstance(args, dict) else {}
+        if tool_name in detect.CODE_TOOLS and isinstance(a.get("code"), str):
+            bait_set = detect._bait(index.paths if index.paths else frozenset())
+            found = None
+            for cmd in codecmds.commands_in_code(a["code"]):
+                d = detect.inspect_scripts(cmd, bait_set, ctx_info)
+                if d is not None:
+                    d = detect.Decision(d.action, d.rule, d.bait_path, cmd, d.script_path)
+                found = _stronger(found, d)
+                if found is not None and found.action == "block":
+                    break
+            return found
+        if tool_name == "computer_use" and str(a.get("action") or "") in ("type", "set_value"):
+            text = a.get("text") if isinstance(a.get("text"), str) else a.get("value")
+            if isinstance(text, str) and detect._PIPE_TO_SHELL_RE.search(text[:detect.MAX_STRING_LEN]):
+                return detect.Decision("approve", "pipe-to-shell", "", text)
+        return None
+    except Exception as exc:
+        alerts.log_error(_DATA_DIR, "extra inspection", exc)
+        return None
+
+
 def on_pre_tool_call(tool_name=None, args=None, **kwargs):
     try:
         session_id = kwargs.get("session_id") or ""
         index = bait.load_index()
         decision, extra, ctx_info = None, None, None
+        check_tool, check_args = _as_terminal(tool_name, args)
         if index.paths:
             last = _LAST_CD.get(session_id) if session_id else None
             ctx_info = detect.Context(cwd=_session_cwd(), home=_HOME,
                                       extra_bases=(last,) if last else ())
-            decision = detect.check_tool_call(tool_name, args, index.paths, ctx_info)
+            decision = detect.check_tool_call(check_tool, check_args, index.paths, ctx_info)
             if decision is None:
                 # A fake value (plain, partial or encoded) in any argument.
                 strings = []
@@ -276,19 +341,26 @@ def on_pre_tool_call(tool_name=None, args=None, **kwargs):
                     decision = detect.Decision("block", "value-in-args", sorted(hits)[0][0],
                                                _preview(tool_name, args))
                     extra = {"value_name": _value_names(hits)}
-        elif tool_name == "terminal" and isinstance(args, dict) and isinstance(args.get("command"), str):
+        elif check_tool == "terminal" and isinstance(check_args, dict) and isinstance(check_args.get("command"), str):
             # No bait planted yet: there is nothing to match a path or value against,
             # but a script can still be read before it runs, and a download piped into
             # a shell still needs approval. Same inspection as with bait, minus bait paths.
             last = _LAST_CD.get(session_id) if session_id else None
             ctx_info = detect.Context(cwd=_session_cwd(), home=_HOME,
                                       extra_bases=(last,) if last else ())
-            wd = args.get("workdir")
+            wd = check_args.get("workdir")
             if isinstance(wd, str) and wd.strip():
                 ctx_info.cwd = detect.normalize(wd.strip(), ctx_info.cwd, ctx_info)
-            decision = detect.inspect_scripts(args["command"], detect._bait(frozenset()), ctx_info)
+            decision = detect.inspect_scripts(check_args["command"], detect._bait(frozenset()), ctx_info)
+        # Code tools and desktop typing: look at the commands inside them too.
+        if decision is None or decision.action != "block":
+            if ctx_info is None:
+                last = _LAST_CD.get(session_id) if session_id else None
+                ctx_info = detect.Context(cwd=_session_cwd(), home=_HOME,
+                                          extra_bases=(last,) if last else ())
+            decision = _stronger(decision, _extra_inspection(tool_name, args, index, ctx_info))
         # The decision above is final. Logging what this call does comes after it.
-        before, _cur = _log_events(session_id, tool_name, _call_events(tool_name, args, decision, index))
+        before, _cur = _log_events(session_id, tool_name, _call_events(check_tool, check_args, decision, index))
         if decision is not None:
             _record(index, session_id, tool_name, decision, extra, before=before,
                     call_id=kwargs.get("tool_call_id") or "")
@@ -296,8 +368,9 @@ def on_pre_tool_call(tool_name=None, args=None, **kwargs):
                 return {"action": "block", "message": detect.BLOCK_MESSAGE}
             return {"action": "approve", "message": detect.approve_message(decision.rule)}
         # Lockdown: after a block, network actions in this session need approval.
-        if LOCK.is_locked(session_id) and _settings()["lockdown"] and \
-                detect.is_network_action(tool_name, args, _untrusted_tool(tool_name)):
+        if LOCK.is_locked(session_id) and _settings()["lockdown"] and (
+                detect.is_network_action(check_tool, check_args, _untrusted_tool(tool_name))
+                or _locked_extra(tool_name, args)):
             return {"action": "approve", "message": lockdown.MESSAGE}
         if ctx_info is not None and tool_name == "terminal" and isinstance(args, dict):
             _remember_cd(session_id, args.get("command") or "", ctx_info)

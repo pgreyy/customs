@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.4
+
+Closes coverage gaps outside the terminal.
+
+- Input sent to a background shell with `process_manage` (`write`, `submit`) is checked like a terminal command:
+  bait paths, script inspection, the pipe-into-a-shell approval, the session trail and lockdown.
+- In `execute_code` and `browser_exec`, commands the Python code passes to `subprocess`, `os.system` and similar
+  calls get script inspection and the pipe check. A new module, `codecmds.py`, reads them from the code with
+  Python's parser (it never runs the code): strings, lists, variables and f-strings.
+- Text typed through `computer_use` gets the pipe-into-a-shell check.
+- While a session is locked, `process_manage` input, `computer_use` typing (`type`, `key`, `set_value`),
+  `cronjob_manage` (`create`, `update`, `run`, `resume`) and `delegate_task` (`spawn`, `steer`) need approval too.
+  Read-only actions such as `poll`, `capture` and `list` are not affected.
+- README: the new coverage, and three limits: cron scripts, calls from inside `execute_code`, and subagents.
+
 ## 0.6.3
 
 - Script inspection and the pipe-into-a-shell approval now run even before any bait is planted. With no bait there
