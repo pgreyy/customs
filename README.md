@@ -83,46 +83,15 @@ specific signal: **the agent is reaching for something that should not be needed
 
 ## How it works
 
-```text
- Untrusted content
- webpage · email · repository · script
-                 |
-                 v
-           Hermes Agent
-                 |
-                 v
-          pre_tool_call
-                 |
-       +---------+----------+
-       |                    |
-  Bait path or fake    Ambiguous broad
-  value detected       filesystem action
-       |                    |
-       v                    v
-   BLOCK + ALERT       REQUEST APPROVAL + ALERT
-       |
-       v
-  Session lockdown (on by default)
-
- If a tool result contains a customs-generated fake value:
-                 |
-                 v
-       transform_tool_result
-                 |
-          redact the value
-                 |
-                 v
-           Hermes Agent
-
- Before a request reaches the model provider:
-                 |
-                 v
-             llm_request
-                 |
-          redact the value
-                 |
-                 v
-          Model provider
+```mermaid
+flowchart TD
+    U["Untrusted content<br/>webpage · email · repo · script"] --> A["Hermes Agent"]
+    A --> P{"pre_tool_call"}
+    P -->|"reaches a bait path or carries a fake value"| B["BLOCK + alert"]
+    P -->|"ambiguous broad<br/>filesystem action"| R["request approval + alert"]
+    B --> L["session lockdown<br/>on by default"]
+    A -. "tool result holds a fake value" .-> T["transform_tool_result<br/>redact"] -.-> A
+    A -. "outgoing request" .-> M["llm_request<br/>redact"] -.-> MP["model provider"]
 ```
 
 ### 1. Decoys that live on disk
