@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.2
+
+- The likely source of an incident now comes only from a call that actually read something. A web, browser or
+  terminal fetch that failed (an error status, an error or `success: false` in the result, a fetch whose results
+  all failed or came back empty, a non-zero exit code, or a file that wasn't found) is no longer recorded as a source.
+  The session trail still tags it as `untrusted-content-attempt`.
+- New README.
+
 ## 0.6.1
 
 Display changes only. Detection, correlation and the core files are unchanged.
@@ -19,7 +27,8 @@ Display changes only. Detection, correlation and the core files are unchanged.
 ## 0.6.0
 
 New capabilities layered on top of the existing tripwire. The bait path tripwire, fake value detection, request
-redaction and lockdown are unchanged, and the bait tripwire is still the only rule that blocks on its own.
+redaction and lockdown are unchanged, and none of the new capabilities blocks a call: blocks still come only from the
+existing rules (a bait path, a fake value in a tool's arguments, or a script that both hunts and uploads).
 
 - **Session event log.** In memory, at most 50 events per session (oldest dropped) and 200 sessions. Each event
   keeps only a type tag (untrusted-content-read, credential-recon, file-staging, encoding-or-transform,

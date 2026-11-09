@@ -12,7 +12,6 @@ MAX_EVENTS per session (oldest dropped) and MAX_SESSIONS sessions.
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 import threading
@@ -20,7 +19,7 @@ import time
 import urllib.parse
 from collections import OrderedDict, deque
 
-from . import alerts, detect
+from . import alerts, detect, provenance
 
 MAX_EVENTS = 50
 MAX_SESSIONS = 200
@@ -225,23 +224,9 @@ def classify_call(tool_name, args, home: str = "") -> list:
 
 
 def call_failed(status, result) -> bool:
-    """True when a finished fetch or browser call reports an error, so nothing was read."""
-    try:
-        if str(status or "").lower() == "error":
-            return True
-        data = json.loads(result) if isinstance(result, str) else result
-        if not isinstance(data, dict):
-            return False
-        if data.get("error") or data.get("success") is False:
-            return True
-        results = data.get("results")
-        if isinstance(results, list):
-            got = [r for r in results if isinstance(r, dict) and not r.get("error")
-                   and (r.get("content") or r.get("text") or r.get("title"))]
-            return not got
-        return False
-    except (ValueError, TypeError):
-        return False
+    """True when a finished call failed, so nothing was read. One rule, shared with
+    provenance, so the trail and the likely source always agree."""
+    return provenance.call_failed(status, result)
 
 
 def untrusted_read_event(sources, home: str = "", failed: bool = False):

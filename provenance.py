@@ -182,6 +182,32 @@ def sources_for(tool_name, args, result, *, home, cwd, untrusted_tool=False) -> 
     return res
 
 
+def call_failed(status, result) -> bool:
+    """True when a finished call reports that it failed, so nothing was read and
+    it must not become a likely source: an error status, an error or
+    success=false in the result, a web fetch whose results all failed or came
+    back empty, a non-zero exit code, or a file that wasn't found."""
+    try:
+        if str(status or "").lower() == "error":
+            return True
+        data = json.loads(result) if isinstance(result, str) else result
+        if not isinstance(data, dict):
+            return False
+        if data.get("error") or data.get("success") is False or data.get("not_found") is True:
+            return True
+        code = data.get("exit_code")
+        if isinstance(code, int) and not isinstance(code, bool) and code != 0:
+            return True
+        results = data.get("results")
+        if isinstance(results, list):
+            got = [r for r in results if isinstance(r, dict) and not r.get("error")
+                   and (r.get("content") or r.get("text") or r.get("title"))]
+            return not got
+        return False
+    except (ValueError, TypeError):
+        return False
+
+
 class Provenance:
     def __init__(self):
         self._lock = threading.Lock()

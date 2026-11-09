@@ -307,10 +307,11 @@ def on_post_tool_call(tool_name=None, args=None, result=None, **kwargs):
         sources = provenance.sources_for(tool_name, args, result, home=_HOME, cwd=_session_cwd(),
                                          untrusted_tool=_untrusted_tool(tool_name))
         if sources:
-            PROV.add(session_id, tool_name, [alerts.redact(s, long_runs=False) for s in sources],
-                     kwargs.get("tool_call_id") or "", kwargs.get("turn_id") or "")
-            _log_events(session_id, tool_name, [events.untrusted_read_event(
-                sources, _HOME, failed=events.call_failed(kwargs.get("status"), result))])
+            failed = provenance.call_failed(kwargs.get("status"), result)
+            if not failed:  # only a call that actually read something can be a likely source
+                PROV.add(session_id, tool_name, [alerts.redact(s, long_runs=False) for s in sources],
+                         kwargs.get("tool_call_id") or "", kwargs.get("turn_id") or "")
+            _log_events(session_id, tool_name, [events.untrusted_read_event(sources, _HOME, failed=failed)])
         writes = provenance.parse_writes(tool_name, args, home=_HOME, cwd=_session_cwd())
         if writes:
             PROV.note_writes(session_id,
