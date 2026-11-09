@@ -310,7 +310,7 @@ def register(ctx):
             make_handler(ctx, runtime),
             description="customs: plant fake secrets, see tripwire incidents",
             args_hint="plant [N] | blend N [--preview] | add <path> | status | "
-                      "unplant [path] | incidents [N] | unlock",
+                      "unplant [path] | incidents [N] | unlock | check",
         )
     except Exception as exc:
         alerts.log_error(_DATA_DIR, "register_command", exc)
