@@ -1,13 +1,17 @@
 name: customs
-version: 0.4.0
-description: "customs: bait files that catch a hijacked agent reaching for your credentials"
+title: "customs: bait-file tripwire"
+version: 0.5.0
+description: "Plants fake credential files and blocks a hijacked agent the moment it reaches for one, before any value is read or sent. No network calls by default."
 requires_hermes: ">=0.23.0"
+provides_tools: []
 provides_hooks:
   - pre_tool_call
   - post_tool_call
   - transform_tool_result
 provides_middleware:
   - llm_request
+provides_commands:
+  - customs
 config_schema:
   lockdown:
     type: bool
@@ -16,4 +20,4 @@ config_schema:
   alert_target:
     type: str
     default: ""
-    description: "Where to push alerts through Hermes messaging, for example telegram or telegram:<chat id>. Empty means no push."
+    description: "Optional, off by default. A Hermes messaging target such as telegram or telegram:<chat id>; alerts are also pushed there through hermes send. Empty means no push and no network calls."
