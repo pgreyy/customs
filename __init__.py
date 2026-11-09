@@ -1,92 +1,110 @@
-"""customs, Phase 0 probe.
+"""customs: a tripwire and a quarantine for your Hermes agent.
 
-Writes down exactly what Hermes passes to our hooks, so the real
-plugin is built on real data instead of guesses.
+Wiring only. The logic lives in bait.py (bait files and the index),
+detect.py (does a tool call touch bait?), alerts.py (incident and error logs)
+and commands.py (/customs).
+
+pre_tool_call fails closed in Hermes: if it crashes or hangs, every tool call
+is blocked. So every hook here catches its own errors, logs them to
+errors.log, and lets the call through.
 """
-import json
-import time
-from pathlib import Path
+import os
+import threading
 
-LOG = Path(__file__).parent / "probe.log"
+from . import alerts, bait, detect
+
+_CTX = None
+_DATA_DIR = None
+_HOME = os.path.normpath(os.path.expanduser("~"))
+
+# Last folder each session's terminal cd'd into, so "cd ~/x" then "cat y"
+# is understood. Small and in memory only.
+_LAST_CD = {}
+_LAST_CD_MAX = 200
+_LAST_CD_LOCK = threading.Lock()
 
 
-def _write(event, data):
-    # Never let logging crash anything.
+def _session_cwd() -> str:
     try:
-        line = {"time": time.strftime("%H:%M:%S"), "event": event, **data}
-        with LOG.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(line, default=str) + "\n")
+        cwd = _CTX.session_cwd() if _CTX is not None else ""
     except Exception:
-        pass
+        cwd = ""
+    if isinstance(cwd, str) and cwd.startswith("/"):
+        return os.path.normpath(cwd)
+    return _HOME
 
 
-def _short(value, limit=800):
-    try:
-        text = value if isinstance(value, str) else json.dumps(value, default=str)
-    except Exception:
-        text = repr(value)
-    return text[:limit]
+def _remember_cd(session_id, command, ctx_info) -> None:
+    targets = detect.cd_targets(command, ctx_info)
+    if not targets or not session_id:
+        return
+    with _LAST_CD_LOCK:
+        if len(_LAST_CD) >= _LAST_CD_MAX and session_id not in _LAST_CD:
+            _LAST_CD.pop(next(iter(_LAST_CD)))
+        _LAST_CD[session_id] = targets[-1]
 
 
 def on_pre_tool_call(tool_name=None, args=None, **kwargs):
-    # Runs BEFORE every tool call. If this crashes, Hermes blocks the tool,
-    # so everything sits inside try/except.
     try:
-        _write("pre_tool_call", {
-            "tool": tool_name,
-            "args": _short(args),
-            "other_fields": sorted(kwargs),
-        })
-        # Test switch: anything mentioning this word gets blocked on purpose.
-        if "customs-block-test" in _short(args, 100000):
-            return {"action": "block", "message": "customs probe: blocked a test call on purpose."}
+        index = bait.load_index()
+        if not index.paths:
+            return None
+        session_id = kwargs.get("session_id") or ""
+        last = _LAST_CD.get(session_id) if session_id else None
+        ctx_info = detect.Context(cwd=_session_cwd(), home=_HOME,
+                                  extra_bases=(last,) if last else ())
+        decision = detect.check_tool_call(tool_name, args, index.paths, ctx_info)
+        if decision is None:
+            if tool_name == "terminal" and isinstance(args, dict):
+                _remember_cd(session_id, args.get("command") or "", ctx_info)
+            return None
+        try:
+            alerts.record_incident(_DATA_DIR, session_id=session_id, tool_name=tool_name,
+                                   decision=decision, needles=index.by_text.keys())
+        except Exception as exc:
+            alerts.log_error(_DATA_DIR, "record_incident", exc)
+        if decision.action == "block":
+            return {"action": "block", "message": detect.BLOCK_MESSAGE}
+        return {"action": "approve", "message": detect.APPROVE_MESSAGE}
     except Exception as exc:
-        _write("probe_error", {"where": "pre_tool_call", "error": repr(exc)})
-    return None
+        alerts.log_error(_DATA_DIR, "pre_tool_call", exc)
+        return None
 
 
 def on_post_tool_call(tool_name=None, args=None, result=None, **kwargs):
-    # Runs AFTER every tool call. Only watches, never changes anything.
-    try:
-        _write("post_tool_call", {
-            "tool": tool_name,
-            "status": kwargs.get("status"),
-            "result": _short(result, 400),
-        })
-    except Exception:
-        pass
+    # Phase 4 (provenance) and Phase 5 (quarantine) go here. Observer only.
+    return None
 
 
 def on_llm_request(**kwargs):
-    # Runs before each request to the AI model. We only record its shape.
-    try:
-        request = kwargs.get("request") or {}
-        _write("llm_request", {
-            "request_keys": sorted(request),
-            "other_fields": sorted(k for k in kwargs if k not in ("request", "original_request")),
-            "message_count": len(request.get("messages") or request.get("input") or []),
-        })
-    except Exception:
-        pass
-    return None  # None means: leave the request unchanged
+    # Phase 3 (bait value tripwire) goes here. None leaves the request unchanged.
+    return None
 
 
 def register(ctx):
+    global _CTX, _DATA_DIR
+    _CTX = ctx
+    try:
+        _DATA_DIR = str(ctx.state.data_dir)
+        bait.configure(_DATA_DIR)
+    except Exception:
+        _DATA_DIR = None
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("post_tool_call", on_post_tool_call)
     ctx.register_middleware("llm_request", on_llm_request)
-    try:
-        from . import bait
-        bait.configure(ctx.state.data_dir)  # where load_index() finds the registry
-    except Exception as exc:
-        _write("probe_error", {"where": "bait.configure", "error": repr(exc)})
     try:
         from .commands import make_handler
         ctx.register_command(
             "customs",
             make_handler(ctx),
-            description="customs: plant fake secrets and check on them",
-            args_hint="plant [N] | blend N [--preview] | add <path> | status | unplant [path]",
+            description="customs: plant fake secrets, see tripwire incidents",
+            args_hint="plant [N] | blend N [--preview] | add <path> | status | "
+                      "unplant [path] | incidents [N]",
         )
     except Exception as exc:
-        _write("probe_error", {"where": "register_command", "error": repr(exc)})
+        alerts.log_error(_DATA_DIR, "register_command", exc)
+    try:
+        bait.load_index()   # warm the cache so the first tool call is fast
+        _session_cwd()      # and the session-cwd imports
+    except Exception:
+        pass

@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import shlex
 
-from . import bait
+from . import alerts, bait
 
 USAGE = (
     "Usage:\n"
@@ -17,6 +17,7 @@ USAGE = (
     "                              plant one bait file at a path you choose\n"
     "  /customs status             what's planted and whether each file is still there\n"
     "  /customs unplant [path]     remove one bait file, or all of them\n"
+    "  /customs incidents [N]      the last N tripwire incidents (default 10), newest first\n"
     f"Types: {', '.join(bait.TYPES)}. At most {bait.MAX_BAIT} bait files in total."
 )
 
@@ -168,8 +169,26 @@ def _unplant(data_dir, args) -> str:
     return "\n".join(out)
 
 
+def _incidents(data_dir, args) -> str:
+    n = _int(args[0]) if args else 10
+    if n is None or n < 1 or len(args) > 1:
+        return "customs: use /customs incidents or /customs incidents <N>."
+    rows = alerts.read_incidents(data_dir, min(n, 500))
+    if not rows:
+        return "customs: no incidents recorded."
+    out = [f"customs: last {len(rows)} incident(s), newest first"]
+    for r in rows:
+        when = str(r.get("time", "?")).replace("T", " ")[:19]
+        out.append(f"{when}  {str(r.get('decision', '?')).upper():7}  {r.get('tool_name', '?')}"
+                   f"  rule={r.get('rule', '?')}  bait={_short(str(r.get('bait_path', '')))}")
+        prev = str(r.get("preview", "")).replace("\n", " ")
+        if prev:
+            out.append(f"    {prev}")
+    return "\n".join(out)
+
+
 _ACTIONS = {"plant": _plant, "blend": _blend, "add": _add, "status": _status,
-            "unplant": _unplant}
+            "unplant": _unplant, "incidents": _incidents}
 
 
 def make_handler(ctx):
