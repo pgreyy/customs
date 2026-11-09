@@ -2,21 +2,29 @@
 from __future__ import annotations
 
 import os
+import shlex
 
 from . import bait
 
 USAGE = (
-    "Usage: /customs plant | status | unplant\n"
-    "  plant    create the bait files that are missing (safe to repeat)\n"
-    "  status   list bait files and whether each one is in place\n"
-    "  unplant  delete our bait files and forget the fake values"
+    "Usage:\n"
+    "  /customs plant              plant the default set (one bait file of each type)\n"
+    "  /customs plant <N>          plant N bait files with random names and folders\n"
+    "  /customs blend <N> [--preview]\n"
+    "                              plant N bait files that fit your own folders;\n"
+    "                              --preview only shows the plan\n"
+    "  /customs add <path> [--type T]\n"
+    "                              plant one bait file at a path you choose\n"
+    "  /customs status             what's planted and whether each file is still there\n"
+    "  /customs unplant [path]     remove one bait file, or all of them\n"
+    f"Types: {', '.join(bait.TYPES)}. At most {bait.MAX_BAIT} bait files in total."
 )
 
 _STATE_TEXT = {
     "ours": "in place",
-    "missing": "missing (run /customs plant)",
-    "modified": "changed since planting (left alone)",
-    "not_ours": "a file that isn't ours is here (not touched)",
+    "missing": "MISSING",
+    "modified": "changed since planting",
+    "not_ours": "not ours",
 }
 
 
@@ -25,68 +33,159 @@ def _short(path: str) -> str:
     return "~" + path[len(home):] if path.startswith(home + os.sep) else path
 
 
-def _lines(title, rows):
+def _say(msg: str) -> str:
+    home = os.path.expanduser("~")
+    return "customs: " + msg.replace(home + os.sep, "~" + os.sep)
+
+
+def _int(word: str):
+    try:
+        return int(word)
+    except (TypeError, ValueError):
+        return None
+
+
+def _list(title, rows):
     if not rows:
         return []
-    out = [f"{title}:"]
-    for path, note in rows:
-        out.append(f"  {_short(path)}" + (f"  ({note})" if note else ""))
+    out = [f"{title} ({len(rows)}):"]
+    for row in rows:
+        if isinstance(row, str):
+            out.append(f"  {_short(row)}")
+        else:
+            path, note = row[0], row[1]
+            out.append(f"  {_short(path)}  [{note}]")
     return out
 
 
-def _plant(data_dir) -> str:
-    r = bait.plant(data_dir)
-    out = ["customs: plant"]
-    out += _lines("Created", r["created"])
-    out += _lines("Already present", r["present"])
-    out += _lines("Skipped", r["skipped"])
-    out += _lines("Errors", r["errors"])
-    if not r["created"] and not r["errors"]:
-        out.append("Nothing new to plant.")
+def _failed(rows):
+    if not rows:
+        return []
+    return [f"Couldn't plant ({len(rows)}):"] + [f"  {a}: {b}" for a, b in rows]
+
+
+def _plant(data_dir, args) -> str:
+    if not args:
+        r = bait.plant_default(data_dir)
+        if r["refused"]:
+            return _say(r["refused"])
+        out = ["customs: plant (default set)"]
+        out += _list("Created", r["created"])
+        out += _list("Already in place", r["present"])
+        out += _failed(r["failed"])
+        if not r["created"] and not r["failed"]:
+            out.append("Nothing new to plant.")
+        return "\n".join(out)
+    n = _int(args[0])
+    if n is None or len(args) > 1:
+        return "customs: use /customs plant or /customs plant <N>, where N is a number."
+    if n > bait.MAX_BAIT:
+        return f"customs: {n} is over the limit of {bait.MAX_BAIT} bait files."
+    r = bait.plant_random(data_dir, n)
+    if r["refused"]:
+        return _say(r["refused"])
+    out = [f"customs: plant {n}"]
+    out += _list("Created", r["created"])
+    out += _failed(r["failed"])
     return "\n".join(out)
 
 
-def _status(data_dir) -> str:
+def _blend(data_dir, args) -> str:
+    preview = "--preview" in args
+    rest = [a for a in args if a != "--preview"]
+    n = _int(rest[0]) if len(rest) == 1 else None
+    if n is None:
+        return "customs: use /customs blend <N> [--preview], where N is a number."
+    if n > bait.MAX_BAIT:
+        return f"customs: {n} is over the limit of {bait.MAX_BAIT} bait files."
+    r = bait.blend(data_dir, n, preview)
+    if r["refused"]:
+        return _say(r["refused"])
+    out = [f"customs: blend {n}" + (" (preview, nothing created)" if preview else ""),
+           f"Looked at {r['folders']} likely folders (names only)."]
+    if preview:
+        out += _list("Would plant", [(p, f"{t}, {why}") for p, t, why in r["planned"]])
+        if r["planned"]:
+            out.append("The real run picks again at random, so its spots can differ.")
+    else:
+        out += _list("Created", r["created"])
+        out += _failed(r["failed"])
+    if len(r["planned"]) < n:
+        out.append(f"Only found {len(r['planned'])} safe spot(s) for {n}.")
+    if r["skipped"]:
+        out.append("Spots skipped: " + "; ".join(
+            f"{k} ({v})" for k, v in sorted(r["skipped"].items(), key=lambda kv: -kv[1])))
+    return "\n".join(out)
+
+
+def _add(data_dir, args) -> str:
+    btype = None
+    if "--type" in args:
+        i = args.index("--type")
+        if i + 1 >= len(args):
+            return "customs: --type needs a value: " + ", ".join(bait.TYPES)
+        btype = args[i + 1].lower()
+        args = args[:i] + args[i + 2:]
+    if len(args) != 1:
+        return "customs: use /customs add <path> [--type T]. Quote paths with spaces."
+    r = bait.add(data_dir, args[0], btype)
+    if r["refused"]:
+        return _say(r["refused"])
+    path, t = r["created"]
+    return f"customs: planted {_short(path)} ({bait.TYPE_LABELS.get(t, t)})."
+
+
+def _status(data_dir, _args) -> str:
     s = bait.status(data_dir)
-    if not s["planted"]:
-        return "customs: no bait planted yet. Run /customs plant."
-    out = ["customs: status", f"Bait values made: {s['created']}"]
-    for path, state in s["files"]:
-        out.append(f"  {_short(path)}: {_STATE_TEXT.get(state, state)}")
-    out.append(f"Watching {s['value_count']} fake values "
-               f"({s['watch_count']} strings including encoded forms).")
+    if not s["total"]:
+        return "customs: no bait planted. Run /customs plant."
+    counts = ", ".join(f"{bait.TYPE_LABELS.get(t, t)} {c}" for t, c in sorted(s["counts"].items()))
+    missing = sum(1 for r in s["rows"] if r[3] == "missing")
+    out = [f"customs: {s['total']} of {s['cap']} bait files. {counts}."]
+    if missing:
+        out.append(f"{missing} missing (deleted outside customs).")
+    for path, t, origin, state in s["rows"]:
+        out.append(f"  {_short(path)}  [{t}, {origin}]  {_STATE_TEXT.get(state, state)}")
     out.append(f"Registry: {_short(s['registry'])}")
     return "\n".join(out)
 
 
-def _unplant(data_dir) -> str:
-    r = bait.unplant(data_dir)
-    if not r["registry_cleared"]:
-        return "customs: nothing to unplant (no registry)."
+def _unplant(data_dir, args) -> str:
+    if len(args) > 1:
+        return "customs: use /customs unplant or /customs unplant <path>. Quote paths with spaces."
+    r = bait.unplant(data_dir, args[0] if args else None)
+    if r["refused"]:
+        return _say(r["refused"])
     out = ["customs: unplant"]
-    out += _lines("Deleted", r["deleted"])
-    out += _lines("Kept", r["kept"])
-    out += _lines("Already gone", r["missing"])
+    out += _list("Deleted", r["deleted"])
+    out += _list("Kept", r["kept"])
+    out += _list("Already gone", r["missing"])
     if r["dirs_removed"]:
         out.append("Removed empty folders customs had made: "
                    + ", ".join(_short(d) for d in r["dirs_removed"]))
-    out.append("Registry cleared. The next plant makes new fake values.")
+    if len(out) == 1:
+        out.append("Nothing to remove.")
     return "\n".join(out)
 
 
-_ACTIONS = {"plant": _plant, "status": _status, "unplant": _unplant}
+_ACTIONS = {"plant": _plant, "blend": _blend, "add": _add, "status": _status,
+            "unplant": _unplant}
 
 
 def make_handler(ctx):
     def handle(raw_args: str = "") -> str:
         try:
-            words = (raw_args or "").strip().split()
+            try:
+                words = shlex.split(raw_args or "")
+            except ValueError:
+                words = (raw_args or "").split()
             sub = words[0].lower() if words else ""
             action = _ACTIONS.get(sub)
             if action is None:
                 return USAGE
             data_dir = ctx.state.data_dir
-            return action(data_dir)
+            bait.configure(data_dir)
+            return action(data_dir, words[1:])
         except Exception as exc:
             return f"customs: that didn't work ({exc.__class__.__name__}: {exc})"
     return handle

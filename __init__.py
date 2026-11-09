@@ -76,12 +76,17 @@ def register(ctx):
     ctx.register_hook("post_tool_call", on_post_tool_call)
     ctx.register_middleware("llm_request", on_llm_request)
     try:
+        from . import bait
+        bait.configure(ctx.state.data_dir)  # where load_index() finds the registry
+    except Exception as exc:
+        _write("probe_error", {"where": "bait.configure", "error": repr(exc)})
+    try:
         from .commands import make_handler
         ctx.register_command(
             "customs",
             make_handler(ctx),
             description="customs: plant fake secrets and check on them",
-            args_hint="plant|status|unplant",
+            args_hint="plant [N] | blend N [--preview] | add <path> | status | unplant [path]",
         )
     except Exception as exc:
         _write("probe_error", {"where": "register_command", "error": repr(exc)})
