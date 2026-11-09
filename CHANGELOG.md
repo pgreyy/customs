@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.1
+
+Display changes only. Detection, correlation and the core files are unchanged.
+
+- An approval request is labelled ASKED (never "APPROVE") in `/customs incidents`, alerts and the export. When
+  Hermes reports a person's answer (its `post_approval_response` hook, a new observer that changes nothing), the
+  incident's outcome becomes "user approved" or "user denied". Timeouts, cancellations and automatic decisions
+  are not recorded as a user decision; the outcome stays "escalated to approval".
+- `/customs incidents` hides `bait=` when there is no bait file.
+- A web or browser call that failed is logged as `untrusted-content-attempt`, since nothing was read. Chain
+  correlation doesn't use this tag.
+- Alerts (chat and push) are laid out for a phone: a `customs · BLOCKED`, `customs · ASKED FOR APPROVAL` or
+  `customs · REDACTED` line and the severity, then short labelled sections. Every URL and domain is defanged
+  (`hxxps://`, `[.]`) so it can't be tapped; the incident log and export keep the real text. Paths, commands
+  and steps are sent as inline code so Telegram formatting can't change them.
+
 ## 0.6.0
 
 New capabilities layered on top of the existing tripwire. The bait path tripwire, fake value detection, request

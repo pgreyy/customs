@@ -12,6 +12,7 @@ MAX_EVENTS per session (oldest dropped) and MAX_SESSIONS sessions.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -26,12 +27,13 @@ MAX_SESSIONS = 200
 LABEL_LEN = 80
 
 UNTRUSTED_READ = "untrusted-content-read"
+UNTRUSTED_ATTEMPT = "untrusted-content-attempt"   # a fetch that failed: nothing was read
 RECON = "credential-recon"
 STAGING = "file-staging"
 ENCODING = "encoding-or-transform"
 OUTBOUND = "outbound-attempt"
 BAIT_HIT = "bait-hit"
-TYPES = (UNTRUSTED_READ, RECON, STAGING, ENCODING, OUTBOUND, BAIT_HIT)
+TYPES = (UNTRUSTED_READ, UNTRUSTED_ATTEMPT, RECON, STAGING, ENCODING, OUTBOUND, BAIT_HIT)
 
 # A reference to a credential location or credential-like file name.
 CRED_PATH_RE = re.compile(
@@ -222,8 +224,29 @@ def classify_call(tool_name, args, home: str = "") -> list:
         return []
 
 
-def untrusted_read_event(sources, home: str = ""):
-    """One (type, label, False) event for the sources a finished call read, or None."""
+def call_failed(status, result) -> bool:
+    """True when a finished fetch or browser call reports an error, so nothing was read."""
+    try:
+        if str(status or "").lower() == "error":
+            return True
+        data = json.loads(result) if isinstance(result, str) else result
+        if not isinstance(data, dict):
+            return False
+        if data.get("error") or data.get("success") is False:
+            return True
+        results = data.get("results")
+        if isinstance(results, list):
+            got = [r for r in results if isinstance(r, dict) and not r.get("error")
+                   and (r.get("content") or r.get("text") or r.get("title"))]
+            return not got
+        return False
+    except (ValueError, TypeError):
+        return False
+
+
+def untrusted_read_event(sources, home: str = "", failed: bool = False):
+    """One (type, label, False) event for the sources a finished call read (or
+    tried to read, when it failed), or None."""
     try:
         if not sources:
             return None
@@ -231,7 +254,8 @@ def untrusted_read_event(sources, home: str = ""):
         host = _host(first) if first.startswith(("http://", "https://")) else ""
         lab = host or label(first, home)
         more = len(sources) - 1
-        return (UNTRUSTED_READ, lab + (f" (+{more} more)" if more > 0 else ""), False)
+        return (UNTRUSTED_ATTEMPT if failed else UNTRUSTED_READ,
+                lab + (f" (+{more} more)" if more > 0 else ""), False)
     except Exception:
         return None
 
@@ -299,4 +323,4 @@ class EventLog:
 def describe(event: dict) -> str:
     """One line for incidents and alerts: time, type, tool and label."""
     when = time.strftime("%H:%M:%S", time.localtime(event.get("t", 0)))
-    return f"{when} {event.get('type', '?')} ({event.get('tool', '?')}: {event.get('label', '')})"
+    return f"{when}  {event.get('type', '?')} · {event.get('tool', '?')} {event.get('label', '')}".rstrip()

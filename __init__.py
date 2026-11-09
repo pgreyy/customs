@@ -32,6 +32,15 @@ NOTIFIER = alerts.Notifier(lambda: _DATA_DIR)
 EVENTS = events.EventLog()
 
 _OUTCOME = {"block": "blocked", "approve": "escalated to approval", "redact": "redacted, call allowed"}
+
+# Approval requests waiting for the user's answer: (session_id, tool_call_id) -> incident id.
+_PENDING = {}
+_PENDING_MAX = 500
+_PENDING_LOCK = threading.Lock()
+# What Hermes reports from a person (post_approval_response "choice"). Anything
+# else (timeout, cancelled, an automatic decision) is not recorded as a user decision.
+_USER_CHOICE = {"once": "user approved", "session": "user approved", "always": "user approved",
+                "deny": "user denied"}
 _SEVERITY = {"block": "high", "approve": "medium", "redact": "medium"}
 
 # Last folder each session's terminal cd'd into, so "cd ~/x" then "cat y"
@@ -152,7 +161,7 @@ CHAIN_MESSAGE = ("customs: this call would send data out, and earlier steps in t
                  "expected this.")
 
 
-def _chain_check(index, session_id, tool_name, args, before, cur):
+def _chain_check(index, session_id, tool_name, args, before, cur, call_id=""):
     """Alert only, fail open: an approval request when this outbound call
     completes a strong chain of earlier steps, else None. Never blocks."""
     try:
@@ -165,7 +174,7 @@ def _chain_check(index, session_id, tool_name, args, before, cur):
         decision = detect.Decision("approve", "attack-chain", "", _preview(tool_name, args))
         _record(index, session_id, tool_name, decision,
                 {"chain": [events.describe(e) for e in finding.events], "chain_reason": finding.reason},
-                before=before, severity="high")
+                before=before, severity="high", call_id=call_id)
         return {"action": "approve", "message": CHAIN_MESSAGE}
     except Exception as exc:
         alerts.log_error(_DATA_DIR, "chain check", exc)
@@ -186,7 +195,8 @@ def _forensics(session_id, decision, before, severity=None) -> dict:
         return {}
 
 
-def _record(index, session_id, tool_name, decision, extra=None, before=None, severity=None) -> None:
+def _record(index, session_id, tool_name, decision, extra=None, before=None, severity=None,
+            call_id="") -> None:
     """Write the incident, lock the session on a block, and send alerts.
     The preview is masked twice: partial/encoded fake values (valuescan), then
     exact forms and real-secret shapes (alerts). Alerts use only the entry."""
@@ -215,6 +225,14 @@ def _record(index, session_id, tool_name, decision, extra=None, before=None, sev
     except Exception as exc:
         alerts.log_error(_DATA_DIR, "record_incident", exc)
         return
+    try:
+        if decision.action == "approve" and session_id and call_id and entry.get("id"):
+            with _PENDING_LOCK:
+                if len(_PENDING) >= _PENDING_MAX:
+                    _PENDING.pop(next(iter(_PENDING)))
+                _PENDING[(str(session_id), str(call_id))] = entry["id"]
+    except Exception as exc:
+        alerts.log_error(_DATA_DIR, "pending approval", exc)
     try:
         settings = _settings()
         if decision.action == "block" and settings["lockdown"]:
@@ -261,7 +279,8 @@ def on_pre_tool_call(tool_name=None, args=None, **kwargs):
         # The decision above is final. Logging what this call does comes after it.
         before, _cur = _log_events(session_id, tool_name, _call_events(tool_name, args, decision, index))
         if decision is not None:
-            _record(index, session_id, tool_name, decision, extra, before=before)
+            _record(index, session_id, tool_name, decision, extra, before=before,
+                    call_id=kwargs.get("tool_call_id") or "")
             if decision.action == "block":
                 return {"action": "block", "message": detect.BLOCK_MESSAGE}
             return {"action": "approve", "message": detect.approve_message(decision.rule)}
@@ -272,7 +291,8 @@ def on_pre_tool_call(tool_name=None, args=None, **kwargs):
         if ctx_info is not None and tool_name == "terminal" and isinstance(args, dict):
             _remember_cd(session_id, args.get("command") or "", ctx_info)
         # Correlation can only ask for approval, and only when nothing above decided.
-        return _chain_check(index, session_id, tool_name, args, before, _cur)
+        return _chain_check(index, session_id, tool_name, args, before, _cur,
+                            call_id=kwargs.get("tool_call_id") or "")
     except Exception as exc:
         alerts.log_error(_DATA_DIR, "pre_tool_call", exc)
         return None
@@ -289,7 +309,8 @@ def on_post_tool_call(tool_name=None, args=None, result=None, **kwargs):
         if sources:
             PROV.add(session_id, tool_name, [alerts.redact(s, long_runs=False) for s in sources],
                      kwargs.get("tool_call_id") or "", kwargs.get("turn_id") or "")
-            _log_events(session_id, tool_name, [events.untrusted_read_event(sources, _HOME)])
+            _log_events(session_id, tool_name, [events.untrusted_read_event(
+                sources, _HOME, failed=events.call_failed(kwargs.get("status"), result))])
         writes = provenance.parse_writes(tool_name, args, home=_HOME, cwd=_session_cwd())
         if writes:
             PROV.note_writes(session_id,
@@ -301,6 +322,25 @@ def on_post_tool_call(tool_name=None, args=None, result=None, **kwargs):
                 PROV.note_clone(session_id, alerts.redact(clone[0], long_runs=False), clone[1])
     except Exception as exc:
         alerts.log_error(_DATA_DIR, "post_tool_call", exc)
+    return None
+
+
+def on_post_approval_response(**kwargs):
+    """Observer only: if Hermes reports a person's answer to one of customs'
+    approval requests, note it on that incident. Never guesses."""
+    try:
+        if kwargs.get("decided_by"):  # an automatic decision, not the user's
+            return None
+        answer = _USER_CHOICE.get(str(kwargs.get("choice") or ""))
+        key = (str(kwargs.get("session_id") or ""), str(kwargs.get("tool_call_id") or ""))
+        if not answer or not all(key) or not str(kwargs.get("description") or "").startswith("customs"):
+            return None
+        with _PENDING_LOCK:
+            incident_id = _PENDING.pop(key, None)
+        if incident_id:
+            alerts.record_decision(_DATA_DIR, incident_id, answer)
+    except Exception as exc:
+        alerts.log_error(_DATA_DIR, "post_approval_response", exc)
     return None
 
 
@@ -376,6 +416,7 @@ def register(ctx):
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("post_tool_call", on_post_tool_call)
     ctx.register_hook("transform_tool_result", on_transform_tool_result)
+    ctx.register_hook("post_approval_response", on_post_approval_response)
     ctx.register_middleware("llm_request", on_llm_request)
     try:
         from .commands import make_handler

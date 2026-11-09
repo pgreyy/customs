@@ -9,6 +9,7 @@ import contextvars
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import threading
@@ -71,6 +72,7 @@ def _append(path: Path, line: str) -> None:
 
 def record_incident(data_dir, *, session_id, tool_name, decision, needles=(), extra=None) -> None:
     entry = {
+        "id": secrets.token_hex(6),
         "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "session_id": str(session_id or ""),
         "tool_name": str(tool_name or ""),
@@ -91,7 +93,7 @@ def record_incident(data_dir, *, session_id, tool_name, decision, needles=(), ex
 
 
 def read_incidents(data_dir, n: int = 10) -> list:
-    """Last n incidents, newest first."""
+    """Last n incidents, newest first, with any later user decision merged in."""
     path = Path(data_dir) / INCIDENTS_NAME
     try:
         with open(path, "rb") as fh:
@@ -101,17 +103,37 @@ def read_incidents(data_dir, n: int = 10) -> list:
             lines = fh.read().decode("utf-8", errors="replace").splitlines()
     except FileNotFoundError:
         return []
-    out = []
+    out, decisions = [], {}
     for line in reversed(lines):
         try:
             item = json.loads(line)
         except ValueError:
             continue
-        if isinstance(item, dict):
-            out.append(item)
+        if not isinstance(item, dict):
+            continue
+        if "decision_for" in item:  # a user's answer to an approval request, logged later
+            decisions.setdefault(str(item["decision_for"]), item.get("user_decision"))
+            continue
+        ans = decisions.get(str(item.get("id", "")))
+        if ans in USER_DECISIONS:
+            item = dict(item, user_decision=ans, outcome=ans)
+        out.append(item)
         if len(out) >= n:
             break
     return out
+
+
+USER_DECISIONS = ("user approved", "user denied")
+
+
+def record_decision(data_dir, incident_id: str, user_decision: str) -> None:
+    """Append the user's answer to an approval request. Only the two values Hermes
+    reports from a person are accepted; anything else is not recorded."""
+    if not incident_id or user_decision not in USER_DECISIONS:
+        return
+    _append(Path(data_dir) / INCIDENTS_NAME, json.dumps(
+        {"decision_for": str(incident_id), "user_decision": user_decision,
+         "time": time.strftime("%Y-%m-%dT%H:%M:%S%z")}))
 
 
 def log_error(data_dir, where: str, exc: BaseException) -> None:
@@ -130,24 +152,10 @@ def log_error(data_dir, where: str, exc: BaseException) -> None:
 
 PUSH_INTERVAL = 30.0  # seconds between pushes for one session
 
-_WHAT = {
-    "block": "customs BLOCKED a {tool} call: it tried to access protected credentials.",
-    "approve": "customs asked for your approval on a {tool} call: it would read or move a folder "
-               "holding credentials.",
-    "redact": "customs REDACTED protected credentials from {where}.",
-}
-
-
-# Approval alerts whose reason isn't "a folder holding credentials".
-_APPROVE_WHAT = {
-    "pipe-to-shell": "customs asked for your approval on a {tool} call: it pipes a downloaded script "
-                     "straight into a shell, so its contents can't be inspected.",
-    "script-hunt": "customs asked for your approval on a {tool} call: the script it runs searches "
-                   "for credential files.",
-    "attack-chain": "customs asked for your approval on a {tool} call: it would send data out, and "
-                    "earlier steps in this session looked like credential searching and packaging. "
-                    "The steps may be unrelated.",
-}
+# How a decision is labelled anywhere a person reads it.
+LABEL = {"block": "BLOCKED", "approve": "ASKED", "redact": "REDACTED"}
+_HEAD = {"block": "BLOCKED", "approve": "ASKED FOR APPROVAL", "redact": "REDACTED"}
+_DEFAULT_SEVERITY = {"block": "high", "approve": "medium", "redact": "medium"}
 
 
 def _short(path: str) -> str:
@@ -155,39 +163,105 @@ def _short(path: str) -> str:
     return "~" + path[len(home):] if path and path.startswith(home + os.sep) else (path or "")
 
 
+# ---------------------------------------------------------------- defanging (alerts only)
+
+# Endings that make Telegram turn text into a link. File extensions that are
+# also country domains (.sh, .py, .pl, .md, .rs, .so) and .zip/.mov are left
+# out, so script and file names stay readable.
+_TLDS = ("com", "net", "org", "edu", "gov", "mil", "int", "io", "dev", "app", "ai", "co", "me", "info",
+         "biz", "xyz", "site", "online", "tech", "cloud", "page", "link", "live", "pro", "gg", "tv",
+         "us", "uk", "de", "fr", "nl", "ru", "cn", "jp", "in", "br", "au", "ca", "eu", "ch", "se", "es",
+         "it", "be", "at", "dk", "fi", "ie", "nz", "za", "kr", "tw", "hk", "sg", "mx", "ar",
+         "invalid", "example", "test", "localhost", "local", "internal", "onion")
+_URL_DEFANG_RE = re.compile(r"\b(h)tt(ps?)://([^\s/`'\"<>)\]]+)", re.I)
+_DOMAIN_DEFANG_RE = re.compile(
+    r"(?<![\w-])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:" + "|".join(_TLDS) + r"))(?![\w-])", re.I)
+
+
+def defang(text: str) -> str:
+    """https://a.b.com/x -> hxxps://a[.]b[.]com/x, and bare a.b.com -> a[.]b[.]com.
+    Used only for alerts; the incident log and the export keep the real text."""
+    t = _URL_DEFANG_RE.sub(lambda m: m.group(1) + "xx" + m.group(2) + "://" + m.group(3).replace(".", "[.]"),
+                           str(text or ""))
+    return _DOMAIN_DEFANG_RE.sub(lambda m: m.group(1).replace(".", "[.]"), t)
+
+
+def _code(text: str) -> str:
+    """Inline code: Hermes' Telegram formatter passes code through untouched, so
+    underscores and asterisks in paths or commands can't turn into formatting."""
+    t = re.sub(r"\s*[\r\n]+\s*", " ", str(text or "")).strip().replace("`", "'")
+    # hermes send switches to HTML when it sees anything tag-like (<redacted>, cat <f >x),
+    # and Telegram then rejects the message as bad HTML: use look-alike brackets instead.
+    t = t.replace("<", "\u2039").replace(">", "\u203a")
+    return f"`{t}`" if t else ""
+
+
+# ---------------------------------------------------------------- alert text
+
+def _what_happened(decision: str, rule: str, tool: str) -> str:
+    t = _code(tool)
+    if decision == "redact":
+        if tool == "llm_request":
+            return ("A request to the model provider contained a fake credential value. "
+                    "customs replaced it before the request was sent.")
+        return f"A {t} result contained a fake credential value. customs replaced it before the model saw it."
+    if decision == "block":
+        if rule == "value-in-args":
+            return f"A {t} call carried a fake credential value, possibly encoded. customs stopped it before it ran."
+        if rule == "script-bait":
+            return f"The script this {t} call runs touches a bait file. customs stopped it before it ran."
+        if rule == "script-exfil":
+            return (f"The script this {t} call runs searches for credential files and uploads them. "
+                    "customs stopped it before it ran.")
+        return (f"A {t} call reached for a bait file, a fake credential nothing legitimate opens. "
+                "customs stopped it before it ran.")
+    if rule == "pipe-to-shell":
+        return (f"This {t} call pipes a downloaded script straight into a shell, so its contents can't be "
+                "inspected. customs asked you to approve it.")
+    if rule == "script-hunt":
+        return f"The script this {t} call runs searches for credential files. customs asked you to approve it."
+    if rule == "attack-chain":
+        return (f"This {t} call would send data out, and earlier steps in this session looked like searching "
+                "for and packaging credentials. They may be unrelated, so customs asked you to approve it.")
+    return f"This {t} call would read or move a folder holding credentials. customs asked you to approve it."
+
+
 def alert_text(entry: dict) -> str:
-    """Short alert built only from the incident entry (already masked)."""
+    """The alert for chat and push, built only from the (already masked) entry.
+    Short labelled sections for a phone screen; URLs and domains defanged."""
     decision = entry.get("decision", "")
     tool = entry.get("tool_name", "") or "tool"
-    rule = entry.get("rule", "")
-    if decision == "redact":
-        where = "a model request" if tool == "llm_request" else f"a {tool} result"
-        head = _WHAT["redact"].format(where=where)
-    elif decision == "approve" and rule in _APPROVE_WHAT:
-        head = _APPROVE_WHAT[rule].format(tool=tool)
-    else:
-        head = _WHAT.get(decision, "customs incident in a {tool} call.").format(tool=tool)
-    rule_line = f"Rule: {entry.get('rule', '?')}."
-    if entry.get("bait_path"):
-        rule_line += f" Bait file: {_short(entry.get('bait_path', ''))}."
+    rule = entry.get("rule", "") or "?"
+    severity = entry.get("severity") or _DEFAULT_SEVERITY.get(decision, "medium")
+    parts = [f"customs · {_HEAD.get(decision, decision.upper() or 'INCIDENT')}\nSeverity: {severity}",
+             "What happened\n" + _what_happened(decision, rule, tool)]
+    rule_block = "Rule\n" + _code(rule)
     if entry.get("chain_reason"):
-        rule_line += f" Pattern: {entry['chain_reason']}."
-    lines = [head, rule_line, f"Likely source: {entry.get('source') or 'none seen'}."]
-    if entry.get("outcome"):
-        lines.append(f"Outcome: {entry['outcome']}. Severity: {entry.get('severity', '?')}. "
-                     f"Lockdown for this session: {'on' if entry.get('lockdown_active') else 'off'}.")
-    prev = (entry.get("preview") or "").replace("\n", " ")
+        rule_block += "\nPattern: " + str(entry["chain_reason"])
+    parts.append(rule_block)
+    bait_path = entry.get("bait_path") or ""
+    script = entry.get("script") or ""
+    if rule in ("script-exfil", "script-hunt"):
+        script = script or bait_path
+        bait_path = ""
+    if bait_path:
+        parts.append("Bait file\n" + _code(_short(bait_path)))
+    if script:
+        parts.append("Script\n" + _code(_short(script)))
+    prev = (entry.get("preview") or "").replace("\n", " ")[:PREVIEW_LEN]
     if prev and tool != "llm_request":
-        lines.append(f"Preview (masked): {prev[:PREVIEW_LEN]}")
-    chain = entry.get("chain") or []
+        parts.append(("Command (masked)" if tool == "terminal" else "Preview (masked)") + "\n" + _code(prev))
+    chain = [c for c in (entry.get("chain") or []) if isinstance(c, str)]
+    before = [b for b in (entry.get("before") or []) if isinstance(b, str)]
     if chain:
-        lines.append("Steps seen, oldest first (seen together, not proven connected):")
-        lines += [f"  {c}" for c in chain[-6:]]
-    before = entry.get("before") or []
-    if before and not chain:
-        lines.append("Earlier in this session, most recent last (not necessarily related):")
-        lines += [f"  {b}" for b in before[-5:]]
-    return "\n".join(lines)
+        parts.append("Steps seen together, oldest first (not proven connected)\n"
+                     + "\n".join(_code(c) for c in chain[-6:]))
+    elif before:
+        parts.append("Earlier in this session, most recent last\n" + "\n".join(_code(b) for b in before[-5:]))
+    source = entry.get("source") or ""
+    parts.append(("Source: " + (_code(source) if source and source != "none seen" else "none seen")) + "\n"
+                 + "Lockdown: " + ("on for this session" if entry.get("lockdown_active") else "off"))
+    return defang("\n\n".join(parts))
 
 
 class Notifier:
