@@ -80,8 +80,12 @@ def record_incident(data_dir, *, session_id, tool_name, decision, needles=(), ex
         "preview": redact(decision.preview, needles)[:PREVIEW_LEN],
     }
     for k, v in (extra or {}).items():  # e.g. which kind of value matched; never the value
-        if k not in entry and isinstance(v, (str, int)):
+        if k in entry:
+            continue
+        if isinstance(v, (str, int)):  # bool is an int
             entry[k] = v
+        elif isinstance(v, (list, tuple)):  # short event lines; masked again here
+            entry[k] = [redact(x, needles)[:200] for x in v[:12] if isinstance(x, str)]
     _append(Path(data_dir) / INCIDENTS_NAME, json.dumps(entry, ensure_ascii=False))
     return entry
 
@@ -140,6 +144,9 @@ _APPROVE_WHAT = {
                      "straight into a shell, so its contents can't be inspected.",
     "script-hunt": "customs asked for your approval on a {tool} call: the script it runs searches "
                    "for credential files.",
+    "attack-chain": "customs asked for your approval on a {tool} call: it would send data out, and "
+                    "earlier steps in this session looked like credential searching and packaging. "
+                    "The steps may be unrelated.",
 }
 
 
@@ -160,12 +167,26 @@ def alert_text(entry: dict) -> str:
         head = _APPROVE_WHAT[rule].format(tool=tool)
     else:
         head = _WHAT.get(decision, "customs incident in a {tool} call.").format(tool=tool)
-    lines = [head,
-             f"Rule: {entry.get('rule', '?')}. Bait file: {_short(entry.get('bait_path', ''))}.",
-             f"Likely source: {entry.get('source') or 'none seen'}."]
+    rule_line = f"Rule: {entry.get('rule', '?')}."
+    if entry.get("bait_path"):
+        rule_line += f" Bait file: {_short(entry.get('bait_path', ''))}."
+    if entry.get("chain_reason"):
+        rule_line += f" Pattern: {entry['chain_reason']}."
+    lines = [head, rule_line, f"Likely source: {entry.get('source') or 'none seen'}."]
+    if entry.get("outcome"):
+        lines.append(f"Outcome: {entry['outcome']}. Severity: {entry.get('severity', '?')}. "
+                     f"Lockdown for this session: {'on' if entry.get('lockdown_active') else 'off'}.")
     prev = (entry.get("preview") or "").replace("\n", " ")
     if prev and tool != "llm_request":
         lines.append(f"Preview (masked): {prev[:PREVIEW_LEN]}")
+    chain = entry.get("chain") or []
+    if chain:
+        lines.append("Steps seen, oldest first (seen together, not proven connected):")
+        lines += [f"  {c}" for c in chain[-6:]]
+    before = entry.get("before") or []
+    if before and not chain:
+        lines.append("Earlier in this session, most recent last (not necessarily related):")
+        lines += [f"  {b}" for b in before[-5:]]
     return "\n".join(lines)
 
 

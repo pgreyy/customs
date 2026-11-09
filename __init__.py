@@ -17,7 +17,7 @@ import threading
 import time
 from types import SimpleNamespace
 
-from . import alerts, bait, detect, lockdown, provenance, valuescan
+from . import alerts, bait, correlate, detect, events, lockdown, provenance, valuescan
 
 RESULT_NOTICE = ("customs: this output contained protected credentials and was redacted. "
                  "The user has been alerted.")
@@ -29,6 +29,10 @@ _HOME = os.path.normpath(os.path.expanduser("~"))
 PROV = provenance.Provenance()
 LOCK = lockdown.Lockdown()
 NOTIFIER = alerts.Notifier(lambda: _DATA_DIR)
+EVENTS = events.EventLog()
+
+_OUTCOME = {"block": "blocked", "approve": "escalated to approval", "redact": "redacted, call allowed"}
+_SEVERITY = {"block": "high", "approve": "medium", "redact": "medium"}
 
 # Last folder each session's terminal cd'd into, so "cd ~/x" then "cat y"
 # is understood. Small and in memory only.
@@ -120,7 +124,69 @@ def _preview(tool_name, args) -> str:
         return str(tool_name or "")
 
 
-def _record(index, session_id, tool_name, decision, extra=None) -> None:
+def _log_events(session_id, tool_name, evs):
+    """(events before this call, seqs of this call's events). Never raises and
+    never affects a decision: it runs after the tripwire has decided."""
+    try:
+        before = EVENTS.recent(session_id, 8) if session_id else []
+        evs = [e for e in (evs or []) if e]
+        return before, EVENTS.add(session_id, tool_name, evs)
+    except Exception as exc:
+        alerts.log_error(_DATA_DIR, "event log", exc)
+        return [], []
+
+
+def _call_events(tool_name, args, decision, index) -> list:
+    try:
+        evs = events.classify_call(tool_name, args, _HOME)
+        if decision is not None and (decision.bait_path in index.paths or decision.rule.startswith("value-")):
+            evs.append((events.BAIT_HIT, events.label(decision.bait_path or decision.rule, _HOME), True))
+        return evs
+    except Exception as exc:
+        alerts.log_error(_DATA_DIR, "event classify", exc)
+        return []
+
+
+CHAIN_MESSAGE = ("customs: this call would send data out, and earlier steps in this session looked like "
+                 "searching for and packaging credentials. They may be unrelated. Approve only if you "
+                 "expected this.")
+
+
+def _chain_check(index, session_id, tool_name, args, before, cur):
+    """Alert only, fail open: an approval request when this outbound call
+    completes a strong chain of earlier steps, else None. Never blocks."""
+    try:
+        if not session_id or not cur:
+            return None
+        finding = correlate.evaluate(EVENTS.since_consumed(session_id), cur)
+        if finding is None:
+            return None
+        EVENTS.consume(session_id, finding.last_seq)  # one finding per chain
+        decision = detect.Decision("approve", "attack-chain", "", _preview(tool_name, args))
+        _record(index, session_id, tool_name, decision,
+                {"chain": [events.describe(e) for e in finding.events], "chain_reason": finding.reason},
+                before=before, severity="high")
+        return {"action": "approve", "message": CHAIN_MESSAGE}
+    except Exception as exc:
+        alerts.log_error(_DATA_DIR, "chain check", exc)
+        return None
+
+
+def _forensics(session_id, decision, before, severity=None) -> dict:
+    """The structured part of an incident report. Never raises."""
+    try:
+        sid = session_id or ""
+        locked = LOCK.is_locked(sid) or (decision.action == "block" and _settings()["lockdown"] and bool(sid))
+        return {"outcome": _OUTCOME.get(decision.action, decision.action),
+                "severity": severity or _SEVERITY.get(decision.action, "medium"),
+                "lockdown_active": bool(locked),
+                "before": [events.describe(e) for e in (before or [])]}
+    except Exception as exc:
+        alerts.log_error(_DATA_DIR, "forensics", exc)
+        return {}
+
+
+def _record(index, session_id, tool_name, decision, extra=None, before=None, severity=None) -> None:
     """Write the incident, lock the session on a block, and send alerts.
     The preview is masked twice: partial/encoded fake values (valuescan), then
     exact forms and real-secret shapes (alerts). Alerts use only the entry."""
@@ -142,6 +208,8 @@ def _record(index, session_id, tool_name, decision, extra=None) -> None:
                 else PROV.latest(session_id)
         else:
             extra["source"] = PROV.latest(session_id)
+        for k, v in _forensics(session_id, decision, before, severity).items():
+            extra.setdefault(k, v)
         entry = alerts.record_incident(_DATA_DIR, session_id=session_id, tool_name=tool_name,
                                        decision=decision, needles=index.by_text.keys(), extra=extra)
     except Exception as exc:
@@ -190,8 +258,10 @@ def on_pre_tool_call(tool_name=None, args=None, **kwargs):
                     decision = detect.Decision("block", "value-in-args", sorted(hits)[0][0],
                                                _preview(tool_name, args))
                     extra = {"value_name": _value_names(hits)}
+        # The decision above is final. Logging what this call does comes after it.
+        before, _cur = _log_events(session_id, tool_name, _call_events(tool_name, args, decision, index))
         if decision is not None:
-            _record(index, session_id, tool_name, decision, extra)
+            _record(index, session_id, tool_name, decision, extra, before=before)
             if decision.action == "block":
                 return {"action": "block", "message": detect.BLOCK_MESSAGE}
             return {"action": "approve", "message": detect.approve_message(decision.rule)}
@@ -201,7 +271,8 @@ def on_pre_tool_call(tool_name=None, args=None, **kwargs):
             return {"action": "approve", "message": lockdown.MESSAGE}
         if ctx_info is not None and tool_name == "terminal" and isinstance(args, dict):
             _remember_cd(session_id, args.get("command") or "", ctx_info)
-        return None
+        # Correlation can only ask for approval, and only when nothing above decided.
+        return _chain_check(index, session_id, tool_name, args, before, _cur)
     except Exception as exc:
         alerts.log_error(_DATA_DIR, "pre_tool_call", exc)
         return None
@@ -218,6 +289,7 @@ def on_post_tool_call(tool_name=None, args=None, result=None, **kwargs):
         if sources:
             PROV.add(session_id, tool_name, [alerts.redact(s, long_runs=False) for s in sources],
                      kwargs.get("tool_call_id") or "", kwargs.get("turn_id") or "")
+            _log_events(session_id, tool_name, [events.untrusted_read_event(sources, _HOME)])
         writes = provenance.parse_writes(tool_name, args, home=_HOME, cwd=_session_cwd())
         if writes:
             PROV.note_writes(session_id,
@@ -245,8 +317,10 @@ def on_transform_tool_result(tool_name=None, args=None, result=None, **kwargs):
             return None
         decision = detect.Decision("redact", "value-in-result", sorted(hits)[0][0],
                                    _preview(tool_name, args))
-        _record(index, kwargs.get("session_id") or "", tool_name, decision,
-                {"value_name": _value_names(hits), "action_taken": "redacted"})
+        sid = kwargs.get("session_id") or ""
+        before, _cur = _log_events(sid, tool_name, [(events.BAIT_HIT, "value in result: " + _value_names(hits), True)])
+        _record(index, sid, tool_name, decision,
+                {"value_name": _value_names(hits), "action_taken": "redacted"}, before=before)
         return new.rstrip("\n") + "\n" + RESULT_NOTICE
     except Exception as exc:
         alerts.log_error(_DATA_DIR, "transform_tool_result", exc)
@@ -278,8 +352,10 @@ def on_llm_request(**kwargs):
             _REPORTED.update((session_id, h) for h in fresh)
             decision = detect.Decision("redact", "value-to-provider", fresh[0][0],
                                        f"model request ({kwargs.get('provider') or 'provider'})")
+            before, _cur = _log_events(session_id, "llm_request",
+                                       [(events.BAIT_HIT, "value in model request: " + _value_names(fresh), True)])
             _record(index, session_id, "llm_request", decision,
-                    {"value_name": _value_names(fresh), "action_taken": "redacted"})
+                    {"value_name": _value_names(fresh), "action_taken": "redacted"}, before=before)
         return {"request": new_request, "source": "customs",
                 "reason": "redacted protected credentials"}
     except Exception as exc:
@@ -310,7 +386,7 @@ def register(ctx):
             make_handler(ctx, runtime),
             description="customs: plant fake secrets, see tripwire incidents",
             args_hint="plant [N] | blend N [--preview] | add <path> | status | "
-                      "unplant [path] | incidents [N] | unlock | check",
+                      "unplant [path] | incidents [N] | export [N] | unlock | check",
         )
     except Exception as exc:
         alerts.log_error(_DATA_DIR, "register_command", exc)
