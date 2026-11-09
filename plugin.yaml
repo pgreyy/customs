@@ -1,9 +1,10 @@
 name: customs
-version: 0.2.0
+version: 0.3.0
 description: "customs: bait files that catch a hijacked agent reaching for your credentials"
 requires_hermes: ">=0.23.0"
 provides_hooks:
   - pre_tool_call
   - post_tool_call
+  - transform_tool_result
 provides_middleware:
   - llm_request

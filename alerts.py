@@ -60,7 +60,7 @@ def _append(path: Path, line: str) -> None:
         pass
 
 
-def record_incident(data_dir, *, session_id, tool_name, decision, needles=()) -> None:
+def record_incident(data_dir, *, session_id, tool_name, decision, needles=(), extra=None) -> None:
     entry = {
         "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "session_id": str(session_id or ""),
@@ -70,6 +70,9 @@ def record_incident(data_dir, *, session_id, tool_name, decision, needles=()) ->
         "bait_path": decision.bait_path,
         "preview": redact(decision.preview, needles)[:PREVIEW_LEN],
     }
+    for k, v in (extra or {}).items():  # e.g. which kind of value matched; never the value
+        if k not in entry and isinstance(v, (str, int)):
+            entry[k] = v
     _append(Path(data_dir) / INCIDENTS_NAME, json.dumps(entry, ensure_ascii=False))
 
 
