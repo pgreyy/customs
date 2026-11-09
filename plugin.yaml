@@ -1,0 +1,7 @@
+name: customs
+version: 0.0.1
+description: "customs Phase 0 probe: logs what Hermes sends to hooks"
+requires_hermes: ">=0.23.0"
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
