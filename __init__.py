@@ -1,18 +1,23 @@
 """customs: a tripwire and a quarantine for your Hermes agent.
 
 Wiring only. The logic lives in bait.py (bait files and the index),
-detect.py (does a tool call touch a bait path?), valuescan.py (does a text
-hold a fake value?), alerts.py (incident and error logs) and commands.py.
+detect.py (does a tool call touch a bait path? is it a network action?),
+valuescan.py (does a text hold a fake value?), provenance.py (what untrusted
+things the session read), lockdown.py, alerts.py (incident log, chat and push
+alerts) and commands.py.
 
 pre_tool_call fails closed in Hermes: if it crashes or hangs, every tool call
 is blocked. So every hook here catches its own errors, logs them to
-errors.log, and returns None (lets things through unchanged).
+errors.log, and returns None (lets things through unchanged). Anything slow
+(posting alerts, pushes) runs on background threads.
 """
 import json
 import os
 import threading
+import time
+from types import SimpleNamespace
 
-from . import alerts, bait, detect, valuescan
+from . import alerts, bait, detect, lockdown, provenance, valuescan
 
 RESULT_NOTICE = ("customs: this output contained protected credentials and was redacted. "
                  "The user has been alerted.")
@@ -20,6 +25,10 @@ RESULT_NOTICE = ("customs: this output contained protected credentials and was r
 _CTX = None
 _DATA_DIR = None
 _HOME = os.path.normpath(os.path.expanduser("~"))
+
+PROV = provenance.Provenance()
+LOCK = lockdown.Lockdown()
+NOTIFIER = alerts.Notifier(lambda: _DATA_DIR)
 
 # Last folder each session's terminal cd'd into, so "cd ~/x" then "cat y"
 # is understood. Small and in memory only.
@@ -31,6 +40,49 @@ _LAST_CD_LOCK = threading.Lock()
 # conversation, every later model request carries it; record it once.
 _REPORTED = set()
 _REPORTED_MAX = 2000
+
+_SETTINGS = {"at": 0.0, "lockdown": True, "alert_target": ""}
+_SETTINGS_TTL = 10.0
+_UNTRUSTED_TOOL = {}
+
+
+def _settings() -> dict:
+    """Plugin settings, re-read at most every 10 seconds."""
+    now = time.time()
+    if now - _SETTINGS["at"] < _SETTINGS_TTL:
+        return _SETTINGS
+    _SETTINGS["at"] = now
+    try:
+        lock = _CTX.get_config("lockdown", True)
+        if isinstance(lock, str):
+            lock = lock.strip().lower() not in ("false", "0", "no", "off")
+        _SETTINGS["lockdown"] = bool(lock)
+        target = _CTX.get_config("alert_target", "")
+        _SETTINGS["alert_target"] = target.strip() if isinstance(target, str) else ""
+    except Exception as exc:
+        alerts.log_error(_DATA_DIR, "settings", exc)
+    return _SETTINGS
+
+
+def _untrusted_tool(name) -> bool:
+    """MCP tools and tools that don't ship with Hermes (their output is outside content)."""
+    if not name:
+        return False
+    if name in _UNTRUSTED_TOOL:
+        return _UNTRUSTED_TOOL[name]
+    untrusted = name.startswith("mcp_")
+    if not untrusted:
+        try:
+            from tools.registry import registry
+            entry = registry.get_entry(name)
+            if entry is not None:
+                mod = getattr(entry.handler, "__module__", "") or ""
+                untrusted = not mod.startswith(("tools.", "model_tools", "agent.", "hermes_cli."))
+        except Exception:
+            pass
+    if len(_UNTRUSTED_TOOL) < 1000:
+        _UNTRUSTED_TOOL[name] = untrusted
+    return untrusted
 
 
 def _session_cwd() -> str:
@@ -69,16 +121,41 @@ def _preview(tool_name, args) -> str:
 
 
 def _record(index, session_id, tool_name, decision, extra=None) -> None:
-    """Write an incident. The preview is cleaned twice: partial/encoded fake
-    values (valuescan), then exact forms and real-secret shapes (alerts)."""
+    """Write the incident, lock the session on a block, and send alerts.
+    The preview is masked twice: partial/encoded fake values (valuescan), then
+    exact forms and real-secret shapes (alerts). Alerts use only the entry."""
     try:
         tab = valuescan.table(index)
-        clean = valuescan.redact(decision.preview or "", tab)[0]
-        decision = detect.Decision(decision.action, decision.rule, decision.bait_path, clean)
-        alerts.record_incident(_DATA_DIR, session_id=session_id, tool_name=tool_name,
-                               decision=decision, needles=index.by_text.keys(), extra=extra)
+        raw_preview = decision.preview or ""
+        clean = valuescan.redact(raw_preview, tab)[0]
+        decision = detect.Decision(decision.action, decision.rule, decision.bait_path, clean,
+                                   decision.script_path)
+        extra = dict(extra or {})
+        if decision.rule.startswith("script"):
+            # Only blame a remote source the script is plausibly linked to.
+            extra["source"] = PROV.source_for_script(session_id, decision.script_path, _HOME)
+            if decision.script_path:
+                extra["script"] = decision.script_path
+        elif decision.rule == "pipe-to-shell":
+            urls = provenance.urls_in(raw_preview)
+            extra["source"] = alerts.redact(urls[0], long_runs=False) if urls \
+                else PROV.latest(session_id)
+        else:
+            extra["source"] = PROV.latest(session_id)
+        entry = alerts.record_incident(_DATA_DIR, session_id=session_id, tool_name=tool_name,
+                                       decision=decision, needles=index.by_text.keys(), extra=extra)
     except Exception as exc:
         alerts.log_error(_DATA_DIR, "record_incident", exc)
+        return
+    try:
+        settings = _settings()
+        if decision.action == "block" and settings["lockdown"]:
+            LOCK.lock(session_id, decision.rule, decision.bait_path)
+        text = alerts.alert_text(entry)
+        NOTIFIER.chat(_CTX, text)
+        NOTIFIER.push(_CTX, session_id, text, settings["alert_target"])
+    except Exception as exc:
+        alerts.log_error(_DATA_DIR, "alerts", exc)
 
 
 def _value_names(hits) -> str:
@@ -87,48 +164,71 @@ def _value_names(hits) -> str:
 
 def on_pre_tool_call(tool_name=None, args=None, **kwargs):
     try:
-        index = bait.load_index()
-        if not index.paths:
-            return None
         session_id = kwargs.get("session_id") or ""
-        last = _LAST_CD.get(session_id) if session_id else None
-        ctx_info = detect.Context(cwd=_session_cwd(), home=_HOME,
-                                  extra_bases=(last,) if last else ())
-        decision = detect.check_tool_call(tool_name, args, index.paths, ctx_info)
-        extra = None
-        if decision is None:
-            # Phase 3: a fake value (plain, partial or encoded) in any argument.
-            strings = []
-            valuescan.collect_strings(detect._as_dict(args), strings)
-            tab = valuescan.table(index)
-            budget, hits = valuescan.MAX_SCAN, set()
-            for _c, _k, text in strings:
-                if budget <= 0:
-                    break
-                part = text[:budget]
-                budget -= len(part)
-                hits |= valuescan.find(part, tab).hits
+        index = bait.load_index()
+        decision, extra, ctx_info = None, None, None
+        if index.paths:
+            last = _LAST_CD.get(session_id) if session_id else None
+            ctx_info = detect.Context(cwd=_session_cwd(), home=_HOME,
+                                      extra_bases=(last,) if last else ())
+            decision = detect.check_tool_call(tool_name, args, index.paths, ctx_info)
+            if decision is None:
+                # A fake value (plain, partial or encoded) in any argument.
+                strings = []
+                valuescan.collect_strings(detect._as_dict(args), strings)
+                tab = valuescan.table(index)
+                budget, hits = valuescan.MAX_SCAN, set()
+                for _c, _k, text in strings:
+                    if budget <= 0:
+                        break
+                    part = text[:budget]
+                    budget -= len(part)
+                    hits |= valuescan.find(part, tab).hits
+                    if hits:
+                        break
                 if hits:
-                    break
-            if hits:
-                decision = detect.Decision("block", "value-in-args", sorted(hits)[0][0],
-                                           _preview(tool_name, args))
-                extra = {"value_name": _value_names(hits)}
-        if decision is None:
-            if tool_name == "terminal" and isinstance(args, dict):
-                _remember_cd(session_id, args.get("command") or "", ctx_info)
-            return None
-        _record(index, session_id, tool_name, decision, extra)
-        if decision.action == "block":
-            return {"action": "block", "message": detect.BLOCK_MESSAGE}
-        return {"action": "approve", "message": detect.APPROVE_MESSAGE}
+                    decision = detect.Decision("block", "value-in-args", sorted(hits)[0][0],
+                                               _preview(tool_name, args))
+                    extra = {"value_name": _value_names(hits)}
+        if decision is not None:
+            _record(index, session_id, tool_name, decision, extra)
+            if decision.action == "block":
+                return {"action": "block", "message": detect.BLOCK_MESSAGE}
+            return {"action": "approve", "message": detect.approve_message(decision.rule)}
+        # Lockdown: after a block, network actions in this session need approval.
+        if LOCK.is_locked(session_id) and _settings()["lockdown"] and \
+                detect.is_network_action(tool_name, args, _untrusted_tool(tool_name)):
+            return {"action": "approve", "message": lockdown.MESSAGE}
+        if ctx_info is not None and tool_name == "terminal" and isinstance(args, dict):
+            _remember_cd(session_id, args.get("command") or "", ctx_info)
+        return None
     except Exception as exc:
         alerts.log_error(_DATA_DIR, "pre_tool_call", exc)
         return None
 
 
 def on_post_tool_call(tool_name=None, args=None, result=None, **kwargs):
-    # Phase 4 (provenance) and Phase 5 (quarantine) go here. Observer only.
+    """Observer only: remember untrusted sources this session read."""
+    try:
+        session_id = kwargs.get("session_id") or ""
+        if not session_id or kwargs.get("status") == "blocked":
+            return None
+        sources = provenance.sources_for(tool_name, args, result, home=_HOME, cwd=_session_cwd(),
+                                         untrusted_tool=_untrusted_tool(tool_name))
+        if sources:
+            PROV.add(session_id, tool_name, [alerts.redact(s, long_runs=False) for s in sources],
+                     kwargs.get("tool_call_id") or "", kwargs.get("turn_id") or "")
+        writes = provenance.parse_writes(tool_name, args, home=_HOME, cwd=_session_cwd())
+        if writes:
+            PROV.note_writes(session_id,
+                             [(p, alerts.redact(u, long_runs=False) if u else None) for p, u in writes],
+                             kwargs.get("turn_id") or "")
+        if tool_name == "terminal" and isinstance(args, dict):
+            clone = provenance.parse_git_clone(args.get("command") or "", _HOME, _session_cwd())
+            if clone:
+                PROV.note_clone(session_id, alerts.redact(clone[0], long_runs=False), clone[1])
+    except Exception as exc:
+        alerts.log_error(_DATA_DIR, "post_tool_call", exc)
     return None
 
 
@@ -193,6 +293,8 @@ def register(ctx):
     try:
         _DATA_DIR = str(ctx.state.data_dir)
         bait.configure(_DATA_DIR)
+        PROV.load(_DATA_DIR)
+        LOCK.load(_DATA_DIR)
     except Exception:
         _DATA_DIR = None
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
@@ -201,12 +303,14 @@ def register(ctx):
     ctx.register_middleware("llm_request", on_llm_request)
     try:
         from .commands import make_handler
+        runtime = SimpleNamespace(
+            lockdown=LOCK, settings=_settings, provenance=PROV)
         ctx.register_command(
             "customs",
-            make_handler(ctx),
+            make_handler(ctx, runtime),
             description="customs: plant fake secrets, see tripwire incidents",
             args_hint="plant [N] | blend N [--preview] | add <path> | status | "
-                      "unplant [path] | incidents [N]",
+                      "unplant [path] | incidents [N] | unlock",
         )
     except Exception as exc:
         alerts.log_error(_DATA_DIR, "register_command", exc)

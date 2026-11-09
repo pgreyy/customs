@@ -18,6 +18,7 @@ USAGE = (
     "  /customs status             what's planted and whether each file is still there\n"
     "  /customs unplant [path]     remove one bait file, or all of them\n"
     "  /customs incidents [N]      the last N tripwire incidents (default 10), newest first\n"
+    "  /customs unlock             end lockdown for this session\n"
     f"Types: {', '.join(bait.TYPES)}. At most {bait.MAX_BAIT} bait files in total."
 )
 
@@ -184,6 +185,7 @@ def _incidents(data_dir, args) -> str:
         prev = str(r.get("preview", "")).replace("\n", " ")
         if prev:
             out.append(f"    {prev}")
+        out.append(f"    source: {r.get('source') or 'not recorded'}")
     return "\n".join(out)
 
 
@@ -191,20 +193,62 @@ _ACTIONS = {"plant": _plant, "blend": _blend, "add": _add, "status": _status,
             "unplant": _unplant, "incidents": _incidents}
 
 
-def make_handler(ctx):
-    def handle(raw_args: str = "") -> str:
+def _session_ids(kwargs) -> list:
+    return [v for v in (kwargs.get("session_id"), kwargs.get("session_key"))
+            if isinstance(v, str) and v]
+
+
+def _lockdown_lines(runtime, ids) -> list:
+    if runtime is None:
+        return []
+    try:
+        enabled = runtime.settings()["lockdown"]
+        info = next((runtime.lockdown.info(i) for i in ids if runtime.lockdown.info(i)), None)
+        line = "Lockdown setting: " + ("on" if enabled else "off") + ". This session: "
+        if info:
+            line += (f"LOCKED (rule {info.get('rule', '?')}); network actions need approval. "
+                     "Run /customs unlock to end it.")
+        else:
+            line += "not locked."
+        others = runtime.lockdown.count() - (1 if info else 0)
+        if others > 0:
+            line += f" Other locked sessions: {others}."
+        return [line]
+    except Exception:
+        return []
+
+
+def _unlock(runtime, ids) -> str:
+    if runtime is None:
+        return "customs: lockdown isn't available."
+    if not ids:
+        return "customs: couldn't tell which session this is, so nothing was unlocked."
+    done = runtime.lockdown.unlock(*ids)
+    if done:
+        return "customs: lockdown ended for this session. Network actions run normally again."
+    return "customs: this session isn't locked."
+
+
+def make_handler(ctx, runtime=None):
+    def handle(raw_args: str = "", **kwargs) -> str:
         try:
             try:
                 words = shlex.split(raw_args or "")
             except ValueError:
                 words = (raw_args or "").split()
             sub = words[0].lower() if words else ""
+            ids = _session_ids(kwargs)
+            if sub == "unlock":
+                return _unlock(runtime, ids)
             action = _ACTIONS.get(sub)
             if action is None:
                 return USAGE
             data_dir = ctx.state.data_dir
             bait.configure(data_dir)
-            return action(data_dir, words[1:])
+            out = action(data_dir, words[1:])
+            if sub == "status":
+                out = "\n".join([out] + _lockdown_lines(runtime, ids))
+            return out
         except Exception as exc:
             return f"customs: that didn't work ({exc.__class__.__name__}: {exc})"
     return handle

@@ -24,6 +24,17 @@ BLOCK_MESSAGE = ("customs blocked this action: it tried to access protected cred
                  "The user has been alerted.")
 APPROVE_MESSAGE = ("customs: this command would read or move a folder holding credentials. "
                    "Approve only if you asked for this.")
+# Rules whose approval needs its own wording (the default is APPROVE_MESSAGE).
+APPROVE_MESSAGES = {
+    "pipe-to-shell": ("customs: this command pipes a downloaded script straight into a shell, so its "
+                      "contents can't be inspected. Approve only if you trust the source."),
+    "script-hunt": ("customs: the script this command runs searches for credential files. "
+                    "Approve only if you expected it to."),
+}
+
+
+def approve_message(rule: str) -> str:
+    return APPROVE_MESSAGES.get(rule, APPROVE_MESSAGE)
 
 MAX_FS_CALLS = 50       # lexists/realpath calls per tool call
 SHLEX_LIMIT = 8192      # longer commands get the regex tokenizer
@@ -70,6 +81,7 @@ class Decision:
     rule: str         # which rule fired
     bait_path: str    # the bait file (or a bait file inside the folder) involved
     preview: str      # what the call looked like; the caller redacts and cuts it
+    script_path: str = ""  # for script-* rules: the local script the hit was found in
 
 
 @dataclass
@@ -685,7 +697,17 @@ def check_tool_call(tool_name, args, bait_paths, ctx: Context):
         if isinstance(wd, str) and wd.strip():
             ctx.cwd = normalize(wd.strip(), ctx.cwd, ctx)
         cmd = args.get("command")
-        return check_command(cmd, bait, ctx) if isinstance(cmd, str) else None
+        if not isinstance(cmd, str):
+            return None
+        direct = check_command(cmd, bait, ctx)
+        if direct is not None and direct.action == "block":
+            return direct
+        # Look inside any local script the command runs. A block there wins over
+        # a non-block direct decision; otherwise keep whichever is stronger.
+        script = inspect_scripts(cmd, bait, ctx)
+        if script is not None and script.action == "block":
+            return script
+        return direct or script
 
     if name in CODE_TOOLS:
         code = args.get("code")
@@ -709,3 +731,351 @@ def check_tool_call(tool_name, args, bait_paths, ctx: Context):
     strings = []
     _walk_strings(args, strings)
     return check_strings(strings, bait, ctx)
+
+
+# ---------------------------------------------------------------- lockdown: network actions
+
+NET_COMMANDS = {"curl", "wget", "nc", "ncat", "netcat", "socat", "ssh", "scp", "sftp", "rsync",
+                "ftp", "lftp", "tftp", "telnet", "aria2c", "http", "https", "xh", "gh", "rclone"}
+NET_GIT = {"push", "pull", "fetch", "clone", "ls-remote", "remote"}
+NET_INTERPRETERS = {"python", "python2", "python3", "node", "nodejs", "deno", "bun", "ruby",
+                    "perl", "php"}
+NET_TOOLS = {"web_extract", "web_search", "browser_exec", "send_message"}
+_NET_CODE_RE = re.compile(
+    r"https?://|socket|urllib|requests\.|httpx|aiohttp|http\.client|fetch\(|XMLHttpRequest|axios"
+    r"|net\.connect|smtplib|ftplib|paramiko|websocket|/dev/tcp/|/dev/udp/", re.I)
+
+
+def _command_is_network(command: str, depth: int = 0) -> bool:
+    if not command:
+        return False
+    if "/dev/tcp/" in command or "/dev/udp/" in command:
+        return True
+    for words, _r in _segments(_tokenize(command)):
+        name, i = _command_name(words)
+        args = words[i + 1:] if i < len(words) else []
+        if name in NET_COMMANDS:
+            return True
+        if name == "git" and args and args[0] in NET_GIT:
+            return True
+        if name.rstrip("0123456789.") in NET_INTERPRETERS and \
+                any(a in ("-c", "-e", "--eval", "-p", "--print", "-") for a in args) and \
+                _NET_CODE_RE.search(" ".join(args)):
+            return True
+        if depth < MAX_DEPTH:
+            for a in args:  # bash -c "curl ...", sh -c, eval "..."
+                if " " in a and _command_is_network(a, depth + 1):
+                    return True
+    return False
+
+
+def is_network_action(tool_name, args, untrusted_tool: bool = False) -> bool:
+    """True for tool calls that can send data off the machine."""
+    name = tool_name or ""
+    if name in NET_TOOLS or name.startswith("browser_") or name.startswith("mcp_") or untrusted_tool:
+        return True
+    a = _as_dict(args)
+    if name == "terminal":
+        cmd = a.get("command")
+        return isinstance(cmd, str) and _command_is_network(cmd[:MAX_STRING_LEN * 4])
+    if name == "execute_code":
+        code = a.get("code")
+        return isinstance(code, str) and bool(_NET_CODE_RE.search(code[:MAX_STRING_LEN * 4]))
+    return False
+
+
+# ---------------------------------------------------------------- script inspection
+
+# "bash install.sh" only shows customs the command string, not what the script
+# does. These functions read the local script a command is about to run and
+# look inside it for bait, credential hunting and uploads. Terminal only.
+
+MAX_SCRIPT_BYTES = 512 * 1024
+MAX_SCRIPTS = 8            # total files read per tool call
+SCRIPT_FOLLOW_DEPTH = 1    # scripts called by the script
+
+_RUNNERS_SHELL = {"bash", "sh", "zsh", "dash", "ksh", "ash", "source", "."}
+_RUNNERS_PY = {"python", "python2", "python3", "py"}
+_RUNNERS_NODE = {"node", "nodejs", "bun", "deno"}
+_SCRIPT_EXT = (".sh", ".bash", ".zsh", ".py", ".js", ".cjs", ".mjs", ".rb", ".pl")
+
+# A search/enumeration aimed at credential-like names, on one line.
+_CRED_NAME_RE = re.compile(
+    r"\.env\b|\.env[._-]|credential|secret|id_rsa|id_dsa|id_ecdsa|id_ed25519|\.pem\b|\.key\b"
+    r"|\bpasswd\b|password|api[._-]?key|\btokens?\b|\.npmrc|\.pypirc|\.netrc|\.aws\b|\.ssh\b"
+    r"|private[._-]?key|wallet|\.p12\b|\.pfx\b", re.I)
+_SEARCH_RE = re.compile(
+    r"\b(?:find|grep|egrep|fgrep|rg|ag|ack|fd|locate|ls)\b|glob\.glob|os\.walk"
+    r"|\.(?:rglob|glob)\s*\(|readdir|walkdir|os\.scandir", re.I)
+# A glob literal reaching for credential files, e.g. ~/.env* or ~/.ssh/id_*
+_CRED_GLOB_RE = re.compile(
+    r"(?:~|\$HOME|/home/[^\s'\"]*)?/?\.(?:ssh|aws|npmrc|pypirc|netrc|env)[^\s'\"]*"
+    r"|[^\s'\"]*id_(?:rsa|dsa|ecdsa|ed25519)[^\s'\"]*"
+    r"|[^\s'\"]*\.(?:pem|p12|pfx)\b|[^\s'\"]*(?:credential|secret|password)[^\s'\"]*\.(?:bak|old|backup|save)",
+    re.I)
+
+# An upload: sending data off the machine.
+_UPLOAD_RE = re.compile(
+    r"curl\b[^\n|]*\s-(?:F|T)\b"
+    r"|curl\b[^\n|]*--(?:form|upload-file|data(?:-binary|-raw|-urlencode)?)\b"
+    r"|curl\b[^\n|]*\s-d\b"
+    r"|wget\b[^\n]*--(?:post-data|post-file|body-data|body-file)\b"
+    r"|\brequests\.(?:post|put|patch)\s*\("
+    r"|urlopen\s*\([^)]*\bdata\s*="
+    r"|http\.client[^\n]*\brequest\s*\(\s*['\"](?:POST|PUT)"
+    r"|fetch\s*\([^)]*method\s*:\s*['\"](?:POST|PUT)"
+    r"|axios\.(?:post|put)\s*\("
+    r"|\b(?:nc|ncat|netcat|socat)\b[^\n]*\b\d{1,5}\b", re.I)
+# scp/rsync to a remote host:path (not local to local).
+_REMOTE_DEST_RE = re.compile(r"\b(?:scp|rsync)\b[^\n]*\s[\w.-]+@[\w.-]+:|\b(?:scp|rsync)\b[^\n]*\s[\w-]+\.[\w.-]+:")
+
+_PIPE_TO_SHELL_RE = re.compile(
+    r"(?:curl|wget|fetch|lynx|links|Invoke-WebRequest|iwr)\b[^\n|]*\|\s*(?:sudo\s+|doas\s+)?"
+    r"(?:bash|sh|zsh|dash|ksh|python3?|node|perl|ruby)\b"
+    r"|(?:bash|sh|zsh)\b[^\n]*<\(\s*(?:curl|wget)\b", re.I)
+
+
+def _read_capped(path: str, limit: int = MAX_SCRIPT_BYTES):
+    """Text of a regular local file, or None. Reads at most limit bytes."""
+    try:
+        import stat as _stat
+        st = os.stat(path)
+        if not _stat.S_ISREG(st.st_mode):
+            return None
+        with open(path, "rb") as fh:
+            return fh.read(limit).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _resolve_existing(token: str, ctx: Context):
+    """First existing absolute path for a script token, or None."""
+    if not token or _unresolved(token):
+        return None
+    for base in _bases(token, ctx):
+        cand = normalize(token, base, ctx)
+        try:
+            if os.path.exists(cand):
+                return cand
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def _script_targets(words, ctx: Context):
+    """(path token, kind) for local files this simple command would run."""
+    if not words:
+        return []
+    name, i = _command_name(words)
+    cmdword = words[i] if i < len(words) else ""
+    args = words[i + 1:] if i < len(words) else []
+    base = posixpath.basename(name)
+    out = []
+    # Running a file directly: ./install.sh, /path/x.sh, ~/x.sh
+    if (cmdword.startswith(("./", "../", "/", "~")) or cmdword.startswith("$")) \
+            and base not in _RUNNERS_SHELL | _RUNNERS_PY | _RUNNERS_NODE:
+        out.append((cmdword, "script"))
+    if base in _RUNNERS_SHELL:
+        for a in args:
+            if a.startswith("-") or a in ("-c", "-lc"):
+                if a in ("-c", "-lc", "-e"):
+                    break  # inline code, not a file
+                continue
+            out.append((a, "shell"))
+            break
+    elif base in _RUNNERS_PY:
+        for a in args:
+            if a in ("-c", "-m", "--version", "-"):
+                break
+            if a.startswith("-"):
+                continue
+            out.append((a, "python"))
+            break
+    elif base in _RUNNERS_NODE:
+        for a in args:
+            if a in ("-e", "--eval", "-p", "--print", "-"):
+                break
+            if a.startswith("-"):
+                continue
+            out.append((a, "node"))
+            break
+    elif base in ("npm", "pnpm", "yarn"):
+        if not args or args[0] in ("install", "i", "ci", "add", "it"):
+            out.append(("package.json", "pkg"))
+    elif base in ("pip", "pip3") and "install" in args:
+        rest = args[args.index("install") + 1:]
+        for a in rest:
+            if a in (".", "-e"):
+                out.append(("setup.py", "setup"))
+                out.append(("pyproject.toml", "setup"))
+            elif a.startswith((".", "/", "~")) and not a.startswith("-"):
+                out.append((posixpath.join(a, "setup.py"), "setup"))
+    return out
+
+
+def _package_json_scripts(text: str):
+    """preinstall/install/postinstall command strings from package.json text."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return []
+    scripts = data.get("scripts") if isinstance(data, dict) else None
+    if not isinstance(scripts, dict):
+        return []
+    return [str(scripts[k]) for k in ("preinstall", "install", "postinstall")
+            if isinstance(scripts.get(k), str)]
+
+
+def _called_scripts(text: str, ctx: Context):
+    """Local scripts invoked from inside a script's text (for one-level follow)."""
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            words = _tokenize(line)
+        except Exception:
+            continue
+        for seg in _segments(words):
+            for tok, _kind in _script_targets(seg[0], ctx):
+                out.append(tok)
+        if len(out) > 20:
+            break
+    return out
+
+
+def _is_cred_glob_word(word: str) -> bool:
+    """A single word that is a wildcard reaching for credential files, such as
+    ~/.env*, ~/.ssh/id_*, *.pem or *credentials*.bak. A plain .env reference
+    (no wildcard) does not count, so dotenv setup scripts aren't flagged."""
+    return bool(set(word) & {"*", "?"}) and bool(_CRED_NAME_RE.search(word))
+
+
+def _hunt_and_upload(text: str):
+    """(hunt, upload) booleans for a script's text."""
+    hunt = False
+    for line in text.splitlines():
+        # a search command aimed at credential filenames or secret values, or a
+        # wildcard reaching for credential files
+        if _SEARCH_RE.search(line) and (_CRED_NAME_RE.search(line) or SECRET_RE.search(line)):
+            hunt = True
+            break
+        if any(_is_cred_glob_word(w) for w in line.split()):
+            hunt = True
+            break
+    upload = bool(_UPLOAD_RE.search(text) or _REMOTE_DEST_RE.search(text))
+    return hunt, upload
+
+
+def _scan_script(text: str, bait: _Bait, ctx: Context):
+    """(bait_path or None, hunt, upload) for one script's text."""
+    bait_path = None
+    if bait.paths:
+        for tok in _tokenize(text):
+            for piece in _pieces(tok):
+                hit = _check_piece(piece, bait, ctx)
+                if hit:
+                    bait_path = hit[1]
+                    break
+            if bait_path:
+                break
+        if bait_path is None:
+            d = _long_input_hit(text, 0, bait, ctx, "script")
+            if d:
+                bait_path = d.bait_path
+    hunt, upload = _hunt_and_upload(text)
+    return bait_path, hunt, upload
+
+
+def inspect_scripts(command: str, bait: _Bait, ctx: Context, reader=None):
+    """Read the local scripts a command runs and look inside them.
+    bait match -> block script-bait; hunt + upload -> block script-exfil;
+    hunt alone -> approve script-hunt; pipe-to-shell -> approve pipe-to-shell."""
+    if not command:
+        return None
+    reader = reader or _read_capped
+    if _PIPE_TO_SHELL_RE.search(command[:MAX_STRING_LEN * 4]):
+        return Decision("approve", "pipe-to-shell", "", command)
+    try:
+        tokens = _tokenize(command[:MAX_STRING_LEN * 4])
+    except Exception:
+        return None
+    # cd targets in this command become bases too (cd repo && ./install.sh).
+    saved = ctx.extra_bases
+    extra = list(ctx.extra_bases)
+    for seg in _segments(tokens):
+        n, i = _command_name(seg[0])
+        if n in ("cd", "pushd") and i + 1 < len(seg[0]):
+            extra.append(normalize(seg[0][i + 1], ctx.cwd, ctx))
+    ctx.extra_bases = tuple(extra)
+    try:
+        queue, seen, reads = [], set(), 0
+        for seg in _segments(tokens):
+            for tok, kind in _script_targets(seg[0], ctx):
+                queue.append((tok, kind, 0))
+        hunt_any = upload_any = False
+        hunt_path = ""
+        while queue and reads < MAX_SCRIPTS:
+            tok, kind, depth = queue.pop(0)
+            path = _resolve_existing(tok, ctx)
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            text = reader(path)
+            if text is None:
+                continue
+            reads += 1
+            if kind == "pkg":
+                script_cmds = _package_json_scripts(text)
+                # a bait/hunt/upload directly in the install hooks
+                blob = "\n".join(script_cmds)
+                bp, h, u = _scan_script(blob, bait, ctx)
+                if bp:
+                    return Decision("block", "script-bait", bp, command, path)
+                hunt_any, upload_any = hunt_any or h, upload_any or u
+                if h and not hunt_path:
+                    hunt_path = path
+                if depth < SCRIPT_FOLLOW_DEPTH:
+                    sub = Context(cwd=posixpath.dirname(path), home=ctx.home,
+                                  extra_bases=ctx.extra_bases, vars=dict(ctx.vars))
+                    for cmd in script_cmds:
+                        for t2, k2 in (tt for w in _segments(_tokenize(cmd)) for tt in _script_targets(w[0], sub)):
+                            queue.append((t2, k2, depth + 1))
+                continue
+            bp, h, u = _scan_script(text, bait, ctx)
+            if bp:
+                return Decision("block", "script-bait", bp, command, path)
+            hunt_any, upload_any = hunt_any or h, upload_any or u
+            if h and not hunt_path:
+                hunt_path = path
+            if depth < SCRIPT_FOLLOW_DEPTH:
+                sub = Context(cwd=posixpath.dirname(path), home=ctx.home,
+                              extra_bases=ctx.extra_bases, vars=dict(ctx.vars))
+                for t2 in _called_scripts(text, sub):
+                    queue.append((t2, "script", depth + 1))
+        if hunt_any and upload_any:
+            return Decision("block", "script-exfil", hunt_path, command, hunt_path)
+        if hunt_any:
+            return Decision("approve", "script-hunt", hunt_path, command, hunt_path)
+        return None
+    finally:
+        ctx.extra_bases = saved
+
+
+def inspect_script_text(text: str, bait_paths=frozenset(), cwd=None, home=None):
+    """Classify a script's TEXT directly (no file reads). The pure core behind
+    inspect_scripts, handy for checking samples by hand. Returns a Decision or
+    None: bait -> block script-bait; hunt+upload -> block script-exfil;
+    hunt alone -> approve script-hunt; upload alone -> None."""
+    home = home or os.path.expanduser("~")
+    ctx = Context(cwd=cwd or home, home=home)
+    bait = _bait(frozenset(bait_paths))
+    bp, hunt, upload = _scan_script(text or "", bait, ctx)
+    if bp:
+        return Decision("block", "script-bait", bp, text)
+    if hunt and upload:
+        return Decision("block", "script-exfil", "", text)
+    if hunt:
+        return Decision("approve", "script-hunt", "", text)
+    return None

@@ -1,5 +1,5 @@
 name: customs
-version: 0.3.0
+version: 0.4.0
 description: "customs: bait files that catch a hijacked agent reaching for your credentials"
 requires_hermes: ">=0.23.0"
 provides_hooks:
@@ -8,3 +8,12 @@ provides_hooks:
   - transform_tool_result
 provides_middleware:
   - llm_request
+config_schema:
+  lockdown:
+    type: bool
+    default: true
+    description: "After a blocked leak attempt, send every network action in that session to approval until /customs unlock."
+  alert_target:
+    type: str
+    default: ""
+    description: "Where to push alerts through Hermes messaging, for example telegram or telegram:<chat id>. Empty means no push."
