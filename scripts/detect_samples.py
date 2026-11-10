@@ -99,7 +99,39 @@ def main() -> int:
         good += _row("value: " + label, "found" if valuescan.find(text, table) else "not found",
                      "found" if want else "not found")
     print(f"\n{good}/{total} as expected.")
-    return 0 if good == total else 1
+    return 0 if good == total and timing() else 1
+
+
+def timing() -> bool:
+    """Hostile one-line inputs at the size limits must scan in well under 1 s.
+    "curl curl curl ..." with no upload flag and no pipe used to make the
+    upload and pipe patterns retry every "curl" and rescan the rest of the line."""
+    import time
+    import codecmds
+    print("\nTiming (limit 1 s each):")
+    bait = frozenset({BAIT})
+    ctx = detect.Context(cwd=HOME, home=HOME)
+
+    def script_512k():
+        detect.inspect_script_text("curl " * (detect.MAX_SCRIPT_BYTES // 5), bait, cwd=HOME, home=HOME)
+
+    def execute_code_64k():
+        for code in ("curl " * (65536 // 5),
+                     'import subprocess\nsubprocess.getoutput("' + "curl " * ((65536 - 60) // 5) + '")\n'):
+            detect.check_tool_call("execute_code", {"code": code}, bait, ctx)
+            detect._hunt_and_upload(code)
+            for cmd in codecmds.commands_in_code(code):
+                detect.inspect_scripts(cmd, detect._bait(bait), ctx)
+
+    ok = True
+    for label, fn in (("512 KB one-line script of 'curl '", script_512k),
+                      ("64 KB of execute_code ('curl ' as text and as a subprocess command)", execute_code_64k)):
+        t0 = time.perf_counter()
+        fn()
+        dt = time.perf_counter() - t0
+        ok = ok and dt < 1.0
+        print(f"{'ok ' if dt < 1.0 else 'BAD'} {label}: {dt:.3f} s")
+    return ok
 
 
 if __name__ == "__main__":

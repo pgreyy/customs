@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.5
+
+- The upload, remote copy and pipe-into-a-shell patterns now scan in linear time. One long line with many `curl` words
+  and no pipe made them backtrack quadratically (seconds at 64 KB). Each line stretch is now scanned once from its
+  first keyword, with no length cap.
+  `scripts/detect_samples.py` times a 512 KB one-line script and 64 KB of `execute_code` (limit 1 s each).
+- The git ignore check before planting passes git only `PATH`, `HOME`, `LANG` and `LC_ALL`, not the rest of the
+  environment.
+
 ## 0.6.4
 
 Closes coverage gaps outside the terminal.

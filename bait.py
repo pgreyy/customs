@@ -435,7 +435,9 @@ def git_problem(path: str):
     root = _git_root(path)
     if root is None:
         return None
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    # Only what git needs to find itself and the user's ignore files; never the
+    # rest of the environment (provider keys and tokens live there).
+    env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "LC_ALL") if k in os.environ}
     try:
         r = subprocess.run(["git", "-C", root, "check-ignore", "-q", "--", path],
                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,

@@ -814,25 +814,60 @@ _CRED_GLOB_RE = re.compile(
     r"|[^\s'\"]*\.(?:pem|p12|pfx)\b|[^\s'\"]*(?:credential|secret|password)[^\s'\"]*\.(?:bak|old|backup|save)",
     re.I)
 
-# An upload: sending data off the machine.
-_UPLOAD_RE = re.compile(
-    r"curl\b[^\n|]*\s-(?:F|T)\b"
-    r"|curl\b[^\n|]*--(?:form|upload-file|data(?:-binary|-raw|-urlencode)?)\b"
-    r"|curl\b[^\n|]*\s-d\b"
-    r"|wget\b[^\n]*--(?:post-data|post-file|body-data|body-file)\b"
-    r"|\brequests\.(?:post|put|patch)\s*\("
-    r"|urlopen\s*\([^)]*\bdata\s*="
-    r"|http\.client[^\n]*\brequest\s*\(\s*['\"](?:POST|PUT)"
-    r"|fetch\s*\([^)]*method\s*:\s*['\"](?:POST|PUT)"
-    r"|axios\.(?:post|put)\s*\("
-    r"|\b(?:nc|ncat|netcat|socat)\b[^\n]*\b\d{1,5}\b", re.I)
-# scp/rsync to a remote host:path (not local to local).
-_REMOTE_DEST_RE = re.compile(r"\b(?:scp|rsync)\b[^\n]*\s[\w.-]+@[\w.-]+:|\b(?:scp|rsync)\b[^\n]*\s[\w-]+\.[\w.-]+:")
+class _KeyThenTail:
+    """Finds KEY, then any run of SPAN characters, then TAIL: the same matches as
+    the regex KEY SPAN* TAIL, in linear time. A plain regex search retries every
+    KEY on a long line and rescans the rest of the line each time, which is
+    quadratic ("curl curl curl ..." with no TAIL). A later KEY inside the run that
+    follows an earlier KEY can only reach what the earlier one reaches, so only
+    the first KEY of each run is tried. KEY's own characters must be in SPAN."""
 
-_PIPE_TO_SHELL_RE = re.compile(
-    r"(?:curl|wget|fetch|lynx|links|Invoke-WebRequest|iwr)\b[^\n|]*\|\s*(?:sudo\s+|doas\s+)?"
-    r"(?:bash|sh|zsh|dash|ksh|python3?|node|perl|ruby)\b"
-    r"|(?:bash|sh|zsh)\b[^\n]*<\(\s*(?:curl|wget)\b", re.I)
+    def __init__(self, key: str, span: str, tail: str, flags: int = 0):
+        self._key = re.compile(key, flags)
+        self._rest = re.compile(span + "*" + tail, flags)
+        self._run = re.compile(span + "*", flags)
+
+    def search(self, text: str):
+        run_end = -1
+        for k in self._key.finditer(text):
+            if k.start() < run_end:
+                continue
+            if self._rest.match(text, k.end()):
+                return True
+            run_end = self._run.match(text, k.end()).end()
+        return None
+
+
+class _AnyOf:
+    """True when any of the parts matches (each part has a .search method)."""
+
+    def __init__(self, *parts):
+        self._parts = parts
+
+    def search(self, text: str):
+        return True if any(p.search(text) for p in self._parts) else None
+
+
+# An upload: sending data off the machine.
+_UPLOAD_RE = _AnyOf(
+    _KeyThenTail(r"curl\b", r"[^\n|]",
+                 r"(?:\s-(?:F|T)\b|--(?:form|upload-file|data(?:-binary|-raw|-urlencode)?)\b|\s-d\b)", re.I),
+    _KeyThenTail(r"wget\b", r"[^\n]", r"--(?:post-data|post-file|body-data|body-file)\b", re.I),
+    re.compile(r"\brequests\.(?:post|put|patch)\s*\(|axios\.(?:post|put)\s*\(", re.I),
+    _KeyThenTail(r"urlopen\s*\(", r"[^)]", r"\bdata\s*=", re.I),
+    _KeyThenTail(r"http\.client", r"[^\n]", r"\brequest\s*\(\s*['\"](?:POST|PUT)", re.I),
+    _KeyThenTail(r"fetch\s*\(", r"[^)]", r"method\s*:\s*['\"](?:POST|PUT)", re.I),
+    _KeyThenTail(r"\b(?:nc|ncat|netcat|socat)\b", r"[^\n]", r"\b\d{1,5}\b", re.I),
+)
+# scp/rsync to a remote host:path (not local to local).
+_REMOTE_DEST_RE = _KeyThenTail(r"\b(?:scp|rsync)\b", r"[^\n]",
+                               r"\s(?:[\w.-]+@[\w.-]+:|[\w-]+\.[\w.-]+:)")
+
+_PIPE_TO_SHELL_RE = _AnyOf(
+    _KeyThenTail(r"(?:curl|wget|fetch|lynx|links|Invoke-WebRequest|iwr)\b", r"[^\n|]",
+                 r"\|\s*(?:sudo\s+|doas\s+)?(?:bash|sh|zsh|dash|ksh|python3?|node|perl|ruby)\b", re.I),
+    _KeyThenTail(r"(?:bash|sh|zsh)\b", r"[^\n]", r"<\(\s*(?:curl|wget)\b", re.I),
+)
 
 
 def _read_capped(path: str, limit: int = MAX_SCRIPT_BYTES):
